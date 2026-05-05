@@ -16,11 +16,14 @@ module LavinMQ
       @filter_match_all = true
       @match_unfiltered = false
       @track_offset = false
+      @tail = false
+      @tail_delivered = false
 
       def initialize(@channel : Client::Channel, @queue : Stream, frame : AMQP::Frame::Basic::Consume)
         @tag = frame.consumer_tag
         validate_preconditions(frame)
         offset = frame.arguments["x-stream-offset"]?
+        @tail = offset == "tail"
         @offset, @segment, @pos = stream_queue.find_offset(offset, @tag, @track_offset)
         super
         @new_message_available = BoolChannel.new(false)
@@ -58,14 +61,14 @@ module LavinMQ
         case frame.arguments["x-stream-offset"]?
         when Nil
           @track_offset = true unless @tag.starts_with?("amq.ctag-")
-        when Int, Time, "first", "next", "last"
+        when Int, Time, "first", "next", "last", "tail"
           case frame.arguments["x-stream-automatic-offset-tracking"]?
           when Bool
             @track_offset = frame.arguments["x-stream-automatic-offset-tracking"]?.as(Bool)
           when String
             @track_offset = frame.arguments["x-stream-automatic-offset-tracking"]? == "true"
           end
-        else raise LavinMQ::Error::PreconditionFailed.new("x-stream-offset must be an integer, a timestamp, 'first', 'next' or 'last'")
+        else raise LavinMQ::Error::PreconditionFailed.new("x-stream-offset must be an integer, a timestamp, 'first', 'next', 'last' or 'tail'")
         end
       end
 
@@ -86,6 +89,12 @@ module LavinMQ
       end
 
       private def deliver_loop
+        # x-stream-offset: tail — empty stream, cancel immediately without delivering
+        if @tail && stream_queue.last_offset.zero?
+          @log.debug { "x-stream-offset=tail on empty stream, cancelling consumer" }
+          cancel
+          return
+        end
         i = 0
         loop do
           wait_for_capacity
@@ -101,6 +110,16 @@ module LavinMQ
           {% end %}
           stream_queue.consume_get(self) do |env|
             deliver(env.message, env.segment_position, env.redelivered)
+            @tail_delivered = true if @tail
+          end
+          # x-stream-offset: tail — deliver at most one message, then cancel.
+          # If the message was filtered out, @offset will have advanced past last_offset
+          # and there is nothing more to wait for, so cancel anyway.
+          if @tail && (@tail_delivered || @offset > stream_queue.last_offset)
+            @log.debug { "x-stream-offset=tail done, cancelling consumer (delivered=#{@tail_delivered})" }
+            flush
+            cancel
+            return
           end
           Fiber.yield if (i &+= 1) % 32768 == 0
         end

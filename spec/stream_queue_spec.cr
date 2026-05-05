@@ -426,6 +426,60 @@ describe LavinMQ::AMQP::Stream do
     end
   end
 
+  describe "x-stream-offset: tail" do
+    it "delivers only the most recent message and then cancels the consumer" do
+      with_amqp_server do |s|
+        with_channel(s) do |ch|
+          q = ch.queue("tail-stream", args: stream_queue_args)
+          5.times { |i| q.publish_confirm "msg-#{i}" }
+          ch.prefetch 10
+          delivered = Channel(String).new(10)
+          cancelled = Channel(String).new(1)
+          ch.on_cancel { |tag| cancelled.send(tag) }
+          q.subscribe(no_ack: false,
+            args: AMQP::Client::Arguments.new({"x-stream-offset": "tail"})) do |msg|
+            delivered.send(msg.body_io.to_s)
+            msg.ack
+          end
+          select
+          when body = delivered.receive
+            body.should eq "msg-4"
+          when timeout(5.seconds)
+            fail "no message delivered for tail offset"
+          end
+          select
+          when cancelled.receive
+            # ok
+          when timeout(5.seconds)
+            fail "broker did not send basic.cancel for tail offset"
+          end
+        end
+      end
+    end
+
+    it "cancels the consumer immediately when the stream is empty" do
+      with_amqp_server do |s|
+        with_channel(s) do |ch|
+          q = ch.queue("tail-stream-empty", args: stream_queue_args)
+          ch.prefetch 10
+          cancelled = Channel(String).new(1)
+          ch.on_cancel { |tag| cancelled.send(tag) }
+          q.subscribe(no_ack: false,
+            args: AMQP::Client::Arguments.new({"x-stream-offset": "tail"})) do |msg|
+            msg.ack
+            fail "no message should be delivered for tail on empty stream"
+          end
+          select
+          when cancelled.receive
+            # ok
+          when timeout(5.seconds)
+            fail "broker did not send basic.cancel for tail offset on empty stream"
+          end
+        end
+      end
+    end
+  end
+
   it "can be purged" do
     with_amqp_server do |s|
       with_channel(s) do |ch|

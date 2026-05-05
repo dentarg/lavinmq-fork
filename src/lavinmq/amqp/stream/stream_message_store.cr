@@ -55,7 +55,13 @@ module LavinMQ::AMQP
       when "first" then offset_at(@segments.first_key, 4u32)
       when "last"  then offset_at(@segments.last_key, 4u32)
       when "next"  then last_offset_seg_pos
-      when Time    then find_offset_in_segments(offset)
+      when "tail"
+        if @size.zero?
+          last_offset_seg_pos
+        else
+          find_offset_in_segments(@last_offset)
+        end
+      when Time then find_offset_in_segments(offset)
       when nil
         consumer_last_offset = last_offset_by_consumer_tag(tag) || 0
         find_offset_in_segments(consumer_last_offset)
