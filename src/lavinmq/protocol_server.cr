@@ -210,18 +210,28 @@ module LavinMQ
         remote_addr = client.remote_address
         set_socket_options(client)
         set_tls_tcp_read_buffer(client)
-        # Followers and load balancers that pass TLS through unterminated put the PROXY header in front of it
-        conn_info = extract_conn_info(client)
+        conn_info = tls_conn_info(client, remote_addr) || next
         ssl_client = OpenSSL::SSL::Socket::Server.new(client, context, sync_close: true)
         Log.info { "#{conn_info.remote_address} connected with #{ssl_client.tls_version} #{ssl_client.cipher} kTLS=#{ssl_client.ktls_status}" }
         handle_tls_connection(ssl_client, conn_info)
-      rescue ex : OpenSSL::SSL::Error | ProxyProtocol::Error | IO::TimeoutError
+      rescue ex : OpenSSL::SSL::Error
         Log.warn { "Error accepting TLS connection from #{remote_addr}: #{ex.message}" }
         client.close rescue nil
       rescue ex
         Log.error(exception: ex) { "Error accepting TLS connection from #{remote_addr}" }
         client.close rescue nil
       end
+    end
+
+    # Followers and load balancers that pass TLS through unterminated put the PROXY
+    # header in front of it. An invalid one, or a peer that sends nothing, is the
+    # client's error, so it's logged like on the TCP listeners, not as unexpected.
+    private def tls_conn_info(client, remote_addr) : ConnectionInfo?
+      extract_conn_info(client)
+    rescue ex : ProxyProtocol::Error | IO::Error | ArgumentError
+      Log.warn { "Error accepting TLS connection from #{remote_addr}: #{ex.message}" }
+      client.close rescue nil
+      nil
     end
 
     private def handle_tls_connection(ssl_client, conn_info)
