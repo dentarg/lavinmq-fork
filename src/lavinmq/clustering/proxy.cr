@@ -22,7 +22,9 @@ module LavinMQ
         File.chmod(path, 0o666)
       end
 
-      def forward_to(target_host, target_port, @proxy_header = false)
+      # A PROXY header from a Unix socket client is forwarded, as the leader's AMQP
+      # and MQTT Unix sockets read them, unless *unix_proxy_header* is false
+      def forward_to(target_host, target_port, @proxy_header = false, @unix_proxy_header = true)
         Log.info { "Proxying from #{@local_address} to #{target_host}:#{target_port}" }
         AcceptLoop.each(@server, "Proxy listener") do |socket|
           spawn handle_client(socket, target_host, target_port), name: "Handle proxy client"
@@ -58,7 +60,10 @@ module LavinMQ
       # The PROXY header to put in front of the connection to the leader, if any.
       # HTTP gets no header of our own, but a load balancer's is still forwarded.
       private def leader_proxy_header(client) : ProxyProtocol::V1?
-        return unless client.is_a? TCPSocket
+        unless client.is_a? TCPSocket
+          drop_proxy_header(client) unless @unix_proxy_header
+          return
+        end
         return if forward_proxy_header?(client)
         return unless @proxy_header
         ProxyProtocol::V1.new(client.remote_address, client.local_address)
@@ -76,6 +81,15 @@ module LavinMQ
         Log.warn { "PROXY protocol from untrusted source #{client.remote_address}, ignoring header" }
         ProxyProtocol.parse(client)
         false
+      end
+
+      # With tcp_proxy_protocol enabled the leader trusts PROXY headers from us on HTTP,
+      # but the HTTP Unix socket doesn't read them
+      private def drop_proxy_header(client) : Nil
+        return unless Config.instance.tcp_proxy_protocol?
+        return unless ProxyProtocol.header?(client)
+        Log.warn { "PROXY protocol on #{@local_address}, ignoring header" }
+        ProxyProtocol.parse(client)
       end
 
       private def set_socket_opts(socket : TCPSocket)
