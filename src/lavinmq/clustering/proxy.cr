@@ -58,15 +58,17 @@ module LavinMQ
       end
 
       # The PROXY header to put in front of the connection to the leader, if any.
-      # HTTP gets no header of our own, but a load balancer's is still forwarded.
+      # HTTP gets no header of our own, and the leader may read PROXY headers from
+      # us there, depending on its config, so a client's that isn't forwarded is dropped.
       private def leader_proxy_header(client) : ProxyProtocol::V1?
-        unless client.is_a? TCPSocket
-          drop_proxy_header(client) unless @unix_proxy_header
-          return
+        if client.is_a? TCPSocket
+          return if forward_proxy_header?(client)
+          return ProxyProtocol::V1.new(client.remote_address, client.local_address) if @proxy_header
+        else
+          return if @unix_proxy_header
         end
-        return if forward_proxy_header?(client)
-        return unless @proxy_header
-        ProxyProtocol::V1.new(client.remote_address, client.local_address)
+        drop_proxy_header(client)
+        nil
       end
 
       # A trusted load balancer's PROXY header is forwarded as is, instead of
@@ -83,10 +85,7 @@ module LavinMQ
         false
       end
 
-      # With tcp_proxy_protocol enabled the leader trusts PROXY headers from us on HTTP,
-      # but the HTTP Unix socket doesn't read them
       private def drop_proxy_header(client) : Nil
-        return unless Config.instance.tcp_proxy_protocol?
         return unless ProxyProtocol.header?(client)
         Log.warn { "PROXY protocol on #{@local_address}, ignoring header" }
         ProxyProtocol.parse(client)

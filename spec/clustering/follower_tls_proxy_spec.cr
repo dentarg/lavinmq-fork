@@ -160,6 +160,10 @@ describe LavinMQ::Clustering::Proxy do
     through_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false).should eq ["data"]
   end
 
+  it "drops a client's PROXY header on HTTP with tcp_proxy_protocol disabled" do
+    through_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false).should eq ["data"]
+  end
+
   it "drops a PROXY header from a client on the HTTP Unix socket" do
     LavinMQ::Config.instance.tcp_proxy_protocol = true
     path = File.tempname("lavinmq-http", ".sock")

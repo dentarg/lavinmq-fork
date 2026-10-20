@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - With `tcp_proxy_protocol` enabled, the AMQPS and MQTTS listeners read a PROXY header from trusted sources before the TLS handshake, so a load balancer that passes TLS through can report the client's address. A follower forwards a trusted load balancer's PROXY header to the leader instead of its own
-- With `tcp_proxy_protocol` enabled, the HTTP and HTTPS listeners read a PROXY header from trusted sources, so the management UI, the HTTP API and WebSocket connections get the client's address. As for AMQP and MQTT, the address never counts as loopback for the default user. Followers forward a trusted load balancer's PROXY header on HTTP and HTTPS, and drop one from an untrusted source or the HTTP Unix socket
+- With `tcp_proxy_protocol` enabled, the HTTP and HTTPS listeners read a PROXY header from trusted sources, so the management UI, the HTTP API and WebSocket connections get the client's address. As for AMQP and MQTT, the address never counts as loopback for the default user. Followers forward a trusted load balancer's PROXY header on HTTP and HTTPS, and drop any other PROXY header there
 
 ### Fixed
 
