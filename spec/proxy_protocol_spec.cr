@@ -1,4 +1,5 @@
 require "log/spec"
+require "http/web_socket"
 require "./spec_helper"
 require "../src/lavinmq/proxy_protocol"
 
@@ -91,6 +92,24 @@ private def amqps_start(port : Int32, proxy_header : Bytes) : Nil
 ensure
   tls.try &.close rescue nil
   socket.try &.close rescue nil
+end
+
+# GET /api/whoami as the default user over *io*, returns the status code
+private def whoami_status(io : IO) : Int32
+  io << "GET /api/whoami HTTP/1.1\r\nHost: localhost\r\n" \
+        "Authorization: Basic Z3Vlc3Q6Z3Vlc3Q=\r\nConnection: close\r\n\r\n"
+  io.flush
+  HTTP::Client::Response.from_io(io, ignore_body: true).status_code
+end
+
+# GET /api/whoami as the default user on the HTTP listener, with *proxy_header* sent first
+private def http_whoami_status(addr : Socket::IPAddress, proxy_header : Bytes?) : Int32
+  socket = TCPSocket.new(addr.address, addr.port)
+  socket.read_timeout = 5.seconds
+  socket.write proxy_header if proxy_header
+  whoami_status(socket)
+ensure
+  socket.try &.close
 end
 
 describe "ProxyProtocol" do
@@ -479,6 +498,79 @@ describe "ProxyProtocol" do
             amqps_start(port, proxy_v2_header_from_client(port))
             logs.check(:warn, /^PROXY protocol from untrusted source /)
             logs.check(:info, /^(127\.0\.0\.1|::1):\d+ connected with /)
+          end
+        end
+      end
+    end
+
+    it "read a PROXY header on HTTP, and the address never counts as loopback" do
+      with_http_server do |http, _|
+        with_proxy_protocol do
+          # The header claims the client is 127.0.0.1, but the default user is limited to loopback
+          http_whoami_status(http.addr, proxy_v2_header).should eq 401
+          http_whoami_status(http.addr, nil).should eq 200
+        end
+      end
+    end
+
+    it "ignore a PROXY header on HTTP from an untrusted source" do
+      with_http_server do |http, _|
+        with_proxy_protocol([LavinMQ::IPMatcher.parse("10.0.0.1")]) do
+          Log.capture("lmq.http.server", :warn) do |logs|
+            # The header is dropped, so the default user is on a real loopback connection
+            http_whoami_status(http.addr, proxy_v2_header).should eq 200
+            logs.check(:warn, /^PROXY protocol from untrusted source /)
+          end
+        end
+      end
+    end
+
+    it "read a PROXY header on HTTPS in front of TLS" do
+      with_amqp_server do |s|
+        with_proxy_protocol do
+          ctx = OpenSSL::SSL::Context::Server.new
+          ctx.certificate_chain = "spec/resources/server_certificate.pem"
+          ctx.private_key = "spec/resources/server_key.pem"
+          addr = s.http_server.bind_tls("127.0.0.1", 0, ctx)
+          spawn(name: "https listen") { s.http_server.listen }
+          Fiber.yield
+          socket = TCPSocket.new(addr.address, addr.port)
+          socket.write proxy_v2_header
+          client_ctx = OpenSSL::SSL::Context::Client.new
+          client_ctx.verify_mode = OpenSSL::SSL::VerifyMode::NONE
+          tls = OpenSSL::SSL::Socket::Client.new(socket, client_ctx, sync_close: true)
+          begin
+            tls.read_timeout = 5.seconds
+            whoami_status(tls).should eq 401
+          ensure
+            tls.close
+          end
+        end
+      end
+    end
+
+    it "give WebSocket connections the client's address from a PROXY header" do
+      with_http_server do |http, s|
+        with_proxy_protocol do
+          s.users.create("foo", "bar")
+          s.users.add_permission "foo", "/", /.*/, /.*/, /.*/
+          socket = TCPSocket.new(http.addr.address, http.addr.port)
+          socket.read_timeout = 5.seconds
+          socket.write proxy_v2_header_from_client(http.addr.port)
+          socket << "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" \
+                    "Sec-WebSocket-Protocol: amqp\r\n\r\n"
+          socket.flush
+          HTTP::Client::Response.from_io(socket, ignore_body: true).status_code.should eq 101
+          ws = HTTP::WebSocket.new(HTTP::WebSocket::Protocol.new(socket, masked: true))
+          conn = AMQP::Client::Connection.start(AMQP::Client::WebSocketIO.new(ws),
+            "foo", "bar", "/", 10u16, 4096u32, 0u16, AMQP::Client::ConnectionInformation.new)
+          begin
+            wait_for { s.connections.present? }
+            connection_addresses(s).should eq ["10.1.2.3:54321"]
+            s.connections.first.as(LavinMQ::AMQP::Client).connection_info.proxied?.should be_true
+          ensure
+            conn.close
           end
         end
       end
