@@ -3,6 +3,7 @@ require "../../stdlib/http_server"
 require "json"
 require "./constants"
 require "./listener"
+require "./proxy_protocol_listener"
 require "./handler/*"
 require "./controller"
 require "./controller/*"
@@ -108,19 +109,31 @@ module LavinMQ
       end
 
       def bind_tcp(address, port)
-        tcp = HTTP.tcp_listener(address, port) { |socket| @http.bind(socket) }
-        Log.info { "Bound to #{tcp.local_address}" }
-        tcp.local_address
+        addr = bind_listener(address, port, nil)
+        Log.info { "Bound to #{addr}" }
+        addr
       end
 
       def bind_tls(address, port, ctx)
-        tcp = HTTP.tcp_listener(address, port) do |socket|
-          tls = OpenSSL::SSL::Server.new(socket, ctx)
-          tls.start_immediately = false
-          @http.bind(tls)
+        addr = bind_listener(address, port, ctx)
+        Log.info { "Bound on #{addr}" }
+        addr
+      end
+
+      private def bind_listener(address, port, tls_context) : ::Socket::IPAddress
+        tcp = HTTP.tcp_listener(address, port) do |tcp_server|
+          @http.bind ProxyProtocolListener.new(tcp_server, tls_context,
+            ->(addr : String) { Config.instance.trusted_proxy_source?(addr) || follower?(addr) },
+            ->follower?(String))
         end
-        Log.info { "Bound on #{tcp.local_address}" }
         tcp.local_address
+      end
+
+      # Followers proxy HTTP to the leader unchanged, except that they only forward
+      # PROXY headers from trusted sources, so their PROXY headers are trusted
+      private def follower?(address : String) : Bool
+        return false unless Config.instance.clustering?
+        @server.all_followers.any? { |f| f.remote_address.address == address }
       end
 
       def bind_unix(path)
