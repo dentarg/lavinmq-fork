@@ -55,11 +55,12 @@ module LavinMQ
         client.close rescue nil
       end
 
-      # The PROXY header to put in front of the connection to the leader, if any
+      # The PROXY header to put in front of the connection to the leader, if any.
+      # HTTP gets no header of our own, but a load balancer's is still forwarded.
       private def leader_proxy_header(client) : ProxyProtocol::V1?
-        return unless @proxy_header
         return unless client.is_a? TCPSocket
         return if forward_proxy_header?(client)
+        return unless @proxy_header
         ProxyProtocol::V1.new(client.remote_address, client.local_address)
       end
 

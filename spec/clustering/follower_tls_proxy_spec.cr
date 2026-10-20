@@ -104,3 +104,39 @@ describe LavinMQ::Clustering::Client do
     end
   end
 end
+
+# Sends *proxy_header* and a request line through a proxy forwarding as for HTTP,
+# returns the lines that reach the leader
+private def through_http_proxy(proxy_header : String) : Array(String)
+  target = TCPServer.new("127.0.0.1", 0)
+  proxy = LavinMQ::Clustering::Proxy.new("127.0.0.1", 0)
+  spawn(name: "proxy spec") { proxy.forward_to("127.0.0.1", target.local_address.port) }
+  client = TCPSocket.new("127.0.0.1", proxy.@server.as(TCPServer).local_address.port)
+  client << proxy_header << "GET / HTTP/1.1\r\n"
+  client.flush
+  upstream = target.accept
+  upstream.read_timeout = 5.seconds
+  lines = [upstream.gets.to_s]
+  lines << upstream.gets.to_s if lines.first.starts_with?("PROXY")
+  lines
+ensure
+  client.try &.close
+  upstream.try &.close
+  proxy.try &.close
+  target.try &.close
+end
+
+describe LavinMQ::Clustering::Proxy do
+  it "forwards a trusted load balancer's PROXY header on HTTP" do
+    LavinMQ::Config.instance.tcp_proxy_protocol = true
+    through_http_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n")
+      .should eq ["PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672", "GET / HTTP/1.1"]
+  end
+
+  it "drops a PROXY header from an untrusted source on HTTP" do
+    config = LavinMQ::Config.instance
+    config.tcp_proxy_protocol = true
+    config.proxy_protocol_trusted_sources = [LavinMQ::IPMatcher.parse("10.0.0.1")]
+    through_http_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n").should eq ["GET / HTTP/1.1"]
+  end
+end
