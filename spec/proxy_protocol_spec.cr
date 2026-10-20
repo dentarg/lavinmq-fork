@@ -49,6 +49,10 @@ private def proxy_v2_header_from_client(port : Int32, tlvs : Bytes = Bytes.empty
   proxy_v2_header(tlvs, address: io.to_slice)
 end
 
+private def connection_addresses(s : LavinMQ::Server) : Array(String)
+  s.connections.compact_map(&.as?(LavinMQ::AMQP::Client)).map(&.connection_info.remote_address.to_s)
+end
+
 # Sends *proxy_header* to the AMQPS listener, then does the TLS handshake and
 # gets Connection.Start, so the server has logged the connection's address
 private def amqps_start(port : Int32, proxy_header : Bytes) : Nil
@@ -518,6 +522,21 @@ describe "ProxyProtocol" do
             s.connections.first.as(LavinMQ::AMQP::Client).connection_info.proxied?.should be_true
           ensure
             conn.close
+          end
+        end
+      end
+    end
+
+    it "log an invalid PROXY header in front of TLS as a warning" do
+      with_amqp_server(tls: true) do |s|
+        with_proxy_protocol do
+          Log.capture("lmq.server", :warn) do |logs|
+            socket = TCPSocket.new("localhost", amqp_tls_port(s))
+            socket.write "PROXY TCP4 a b 1 2\r\n".to_slice
+            socket.read_timeout = 5.seconds
+            socket.read(Bytes.new(1)).should eq 0 # closed by the server
+            socket.close
+            logs.check(:warn, /^Error accepting TLS connection from /)
           end
         end
       end
