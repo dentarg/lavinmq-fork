@@ -107,11 +107,18 @@ end
 
 # Sends *proxy_header* and a line of data through a follower's proxy,
 # returns the lines that reach the leader
-private def through_proxy(proxy_header : String, header_of_its_own : Bool) : Array(String)
+private def through_proxy(proxy_header : String, header_of_its_own : Bool,
+                          unix_path : String? = nil, unix_proxy_header = true) : Array(String)
   target = TCPServer.new("127.0.0.1", 0)
-  proxy = LavinMQ::Clustering::Proxy.new("127.0.0.1", 0)
-  spawn(name: "proxy spec") { proxy.forward_to("127.0.0.1", target.local_address.port, header_of_its_own) }
-  client = TCPSocket.new("127.0.0.1", proxy.@server.as(TCPServer).local_address.port)
+  proxy = unix_path ? LavinMQ::Clustering::Proxy.new(unix_path) : LavinMQ::Clustering::Proxy.new("127.0.0.1", 0)
+  spawn(name: "proxy spec") do
+    proxy.forward_to("127.0.0.1", target.local_address.port, header_of_its_own, unix_proxy_header)
+  end
+  client = if unix_path
+             UNIXSocket.new(unix_path)
+           else
+             TCPSocket.new("127.0.0.1", proxy.@server.as(TCPServer).local_address.port)
+           end
   client << proxy_header << "data\r\n"
   client.flush
   upstream = target.accept
@@ -151,5 +158,23 @@ describe LavinMQ::Clustering::Proxy do
     config.tcp_proxy_protocol = true
     config.proxy_protocol_trusted_sources = [LavinMQ::IPMatcher.parse("10.0.0.1")]
     through_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false).should eq ["data"]
+  end
+
+  it "drops a PROXY header from a client on the HTTP Unix socket" do
+    LavinMQ::Config.instance.tcp_proxy_protocol = true
+    path = File.tempname("lavinmq-http", ".sock")
+    through_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false,
+      unix_path: path, unix_proxy_header: false).should eq ["data"]
+  ensure
+    path.try { |p| File.delete?(p) }
+  end
+
+  it "forwards a PROXY header from a client on the AMQP Unix socket" do
+    LavinMQ::Config.instance.tcp_proxy_protocol = true
+    path = File.tempname("lavinmq-amqp", ".sock")
+    through_proxy("PROXY TCP4 10.1.2.3 127.0.0.1 54321 5671\r\n", header_of_its_own: false, unix_path: path)
+      .should eq ["PROXY TCP4 10.1.2.3 127.0.0.1 54321 5671", "data"]
+  ensure
+    path.try { |p| File.delete?(p) }
   end
 end
