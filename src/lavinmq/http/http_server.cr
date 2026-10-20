@@ -123,14 +123,13 @@ module LavinMQ
       private def bind_listener(address, port, tls_context) : ::Socket::IPAddress
         tcp = HTTP.tcp_listener(address, port) do |tcp_server|
           @http.bind ProxyProtocolListener.new(tcp_server, tls_context,
-            ->(addr : String) { Config.instance.trusted_proxy_source?(addr) || follower?(addr) },
-            ->follower?(String))
+            ->(addr : String) { Config.instance.trusted_proxy_source?(addr) || follower?(addr) })
         end
         tcp.local_address
       end
 
-      # Followers proxy HTTP to the leader unchanged, except that they only forward
-      # PROXY headers from trusted sources, so their PROXY headers are trusted
+      # With tcp_proxy_protocol enabled, followers proxy HTTP to the leader unchanged,
+      # except that they only forward PROXY headers from trusted sources
       private def follower?(address : String) : Bool
         return false unless Config.instance.clustering?
         @server.all_followers.any? { |f| f.remote_address.address == address }
