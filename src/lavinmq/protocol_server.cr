@@ -232,8 +232,8 @@ module LavinMQ
         remote_addr = client.remote_address
         set_socket_options(client)
         set_tls_tcp_read_buffer(client)
-        # A PROXY header comes before TLS, e.g. from a follower forwarding
-        # the connection, see ClientListeners
+        # A PROXY header comes before TLS, from a follower forwarding the
+        # connection (see ClientListeners) or a load balancer passing TLS through
         conn_info = extract_conn_info(client)
         ssl_client = OpenSSL::SSL::Socket::Server.new(client, context, sync_close: true)
         Log.info { "#{conn_info.remote_address} connected with #{ssl_client.tls_version} #{ssl_client.cipher} kTLS=#{ssl_client.ktls_status}" }
@@ -262,7 +262,7 @@ module LavinMQ
       from_follower(client).try { |parsed_proxy| return parsed_proxy }
       if @config.tcp_proxy_protocol?
         parsed_proxy = ProxyProtocol.parse(client)
-        if trusted_proxy_source?(remote_address.address)
+        if @config.trusted_proxy_source?(remote_address.address)
           return parsed_proxy if parsed_proxy
         else
           Log.warn { "PROXY protocol from untrusted source #{remote_address}, ignoring header" } if parsed_proxy
@@ -278,12 +278,6 @@ module LavinMQ
       address = client.remote_address.address
       return unless @server.all_followers.any? { |f| f.remote_address.address == address }
       ProxyProtocol.parse(client)
-    end
-
-    private def trusted_proxy_source?(address : String) : Bool
-      # If no trusted sources are configured, accept from all sources for backward compatibility
-      return true if @config.proxy_protocol_trusted_sources.empty?
-      @config.proxy_protocol_trusted_sources.any?(&.matches?(address))
     end
 
     private def set_socket_options(socket)
