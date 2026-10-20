@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- With `tcp_proxy_protocol` enabled, the AMQPS and MQTTS listeners read a PROXY header from trusted sources before the TLS handshake, so a load balancer that passes TLS through can report the client's address. A follower forwards a trusted load balancer's PROXY header to the leader instead of its own
+
+### Fixed
+
+- PROXY protocol v2 headers are parsed as the spec says. TLVs other than SSL, e.g. AUTHORITY, UNIQUE_ID, NOOP or an AWS VPC endpoint ID, and unknown SSL sub-TLVs are skipped, and `LOCAL` headers, e.g. from health checks, are accepted with the connection's own address. Previously these closed the connection, as did an SSL TLV for a client with a certificate. The SSL TLV's client flags are now read, so a client that didn't use TLS is no longer reported as using it [#1646](https://github.com/cloudamqp/lavinmq/issues/1646)
+
 ## [2.11.0-rc.2] - 2026-10-23
 
 This release adds the `x-mqtt-topic` exchange type, automatic retries with backoff for rejected messages, and the `tcp_send_timeout`, `tls_ciphersuites` and `syncfs_threshold` config options. The management UI charts are redrawn on uPlot, and a refresh control in the header pauses, resumes and paces auto-refresh. Publish confirms sync only the affected files, message store segments are cached in page-sized folios and connections share pooled socket buffers, lowering write amplification and memory usage. Message TTL expiry gets millisecond precision and `tcp_nodelay` defaults to `true`. It also fixes many races around policies, consumers, dead-lettering and message store segments that could corrupt state or crash the broker. Federation links and their upstream resources now survive policy re-applies, publishes over the HTTP API and MQTT respect the disk alarm, and the MQTT retain store no longer mixes up non-ASCII topics or keeps an open file per topic.
