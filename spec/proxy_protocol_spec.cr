@@ -423,6 +423,21 @@ describe "ProxyProtocol" do
         end
       end
     end
+
+    it "log an invalid PROXY header in front of TLS as a warning" do
+      with_amqp_server(tls: true) do |s|
+        with_proxy_protocol do
+          Log.capture("lmq.server", :warn) do |logs|
+            socket = TCPSocket.new("localhost", amqp_tls_port(s))
+            socket.write "PROXY TCP4 a b 1 2\r\n".to_slice
+            socket.read_timeout = 5.seconds
+            socket.read(Bytes.new(1)).should eq 0 # closed by the server
+            socket.close
+            logs.check(:warn, /^Error accepting TLS connection from /)
+          end
+        end
+      end
+    end
   end
 
   describe "trusted sources" do
