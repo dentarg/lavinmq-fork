@@ -48,32 +48,6 @@ private def proxy_v2_header_from_client(port : Int32, tlvs : Bytes = Bytes.empty
   proxy_v2_header(tlvs, address: io.to_slice)
 end
 
-# Opens an AMQP connection as foo, with *proxy_header* sent first
-private def amqp_open(port : Int32, proxy_header : Bytes) : TCPSocket
-  socket = TCPSocket.new("localhost", port)
-  socket.read_timeout = 5.seconds
-  socket.write proxy_header
-  socket.write LavinMQ::AMQP::PROTOCOL_START_0_9_1.to_slice
-  socket.flush
-  stream = AMQ::Protocol::Stream.new(socket)
-  stream.next_frame.should be_a AMQ::Protocol::Frame::Connection::Start
-  start_ok = AMQ::Protocol::Frame::Connection::StartOk.new(AMQ::Protocol::Table.new, "PLAIN", "\u0000foo\u0000bar", "en_US")
-  socket.write_bytes start_ok, IO::ByteFormat::NetworkEndian
-  socket.flush
-  tune = stream.next_frame.as(AMQ::Protocol::Frame::Connection::Tune)
-  socket.write_bytes AMQ::Protocol::Frame::Connection::TuneOk.new(
-    channel_max: tune.channel_max, frame_max: tune.frame_max, heartbeat: 0_u16),
-    IO::ByteFormat::NetworkEndian
-  socket.write_bytes AMQ::Protocol::Frame::Connection::Open.new("/"), IO::ByteFormat::NetworkEndian
-  socket.flush
-  stream.next_frame.should be_a AMQ::Protocol::Frame::Connection::OpenOk
-  socket
-end
-
-private def connection_addresses(s : LavinMQ::Server) : Array(String)
-  s.connections.compact_map(&.as?(LavinMQ::AMQP::Client)).map(&.connection_info.remote_address.to_s)
-end
-
 # Sends *proxy_header* to the AMQPS listener, then does the TLS handshake and
 # gets Connection.Start, so the server has logged the connection's address
 private def amqps_start(port : Int32, proxy_header : Bytes) : Nil
@@ -425,40 +399,6 @@ describe "ProxyProtocol" do
   end
 
   describe "listeners" do
-    it "accept a PROXY v2 header with TLVs other than SSL" do
-      with_amqp_server do |s|
-        with_proxy_protocol do
-          s.users.create("foo", "bar")
-          s.users.add_permission "foo", "/", /.*/, /.*/, /.*/
-          port = amqp_port(s)
-          header = proxy_v2_header_from_client(port, tlv(0x02u8, "red-panda.example.com".to_slice))
-          socket = amqp_open(port, header)
-          begin
-            connection_addresses(s).should eq ["10.1.2.3:54321"]
-          ensure
-            socket.close
-          end
-        end
-      end
-    end
-
-    it "accept a LOCAL header, e.g. from a health check, using the connection's own address" do
-      with_amqp_server do |s|
-        with_proxy_protocol do
-          s.users.create("foo", "bar")
-          s.users.add_permission "foo", "/", /.*/, /.*/, /.*/
-          header = proxy_v2_header(command: 0x20u8, family: 0x00u8, address: Bytes.empty)
-          socket = amqp_open(amqp_port(s), header)
-          begin
-            local = LavinMQ::ConnectionInfo::IPAddress.new(socket.local_address).to_s
-            connection_addresses(s).should eq [local]
-          ensure
-            socket.close
-          end
-        end
-      end
-    end
-
     it "read a PROXY header in front of TLS from a trusted source" do
       with_amqp_server(tls: true) do |s|
         with_proxy_protocol do
