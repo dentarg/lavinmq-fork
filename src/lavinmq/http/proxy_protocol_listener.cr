@@ -26,18 +26,18 @@ module LavinMQ
     end
 
     # Accepts connections for the HTTP server. With tcp_proxy_protocol enabled,
-    # or from a follower, connections may start with a PROXY header, otherwise
-    # it accepts like `HTTP::Server#bind_tcp` and `#bind_tls` do.
+    # connections may start with a PROXY header, otherwise it accepts like
+    # `HTTP::Server#bind_tcp` and `#bind_tls` do.
     class ProxyProtocolListener
       include ::Socket::Server
 
       def initialize(@server : TCPServer, @tls_context : OpenSSL::SSL::Context::Server?,
-                     @trusted : String -> Bool, @follower : String -> Bool)
+                     @trusted : String -> Bool)
       end
 
       def accept? : IO?
         client = @server.accept? || return
-        if proxy_protocol?(client)
+        if Config.instance.tcp_proxy_protocol?
           ProxiedConnection.new(client, @tls_context, @trusted)
         elsif ctx = @tls_context
           # The handshake is done by HTTP::Server, in the connection's fiber
@@ -57,15 +57,6 @@ module LavinMQ
 
       def close : Nil
         @server.close
-      end
-
-      private def proxy_protocol?(client : TCPSocket) : Bool
-        config = Config.instance
-        return true if config.tcp_proxy_protocol?
-        return false unless config.clustering?
-        @follower.call(client.remote_address.address)
-      rescue ::Socket::Error # the peer is already gone
-        false
       end
     end
 

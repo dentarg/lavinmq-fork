@@ -513,6 +513,13 @@ describe "ProxyProtocol" do
       end
     end
 
+    it "don't read PROXY headers on HTTP with tcp_proxy_protocol disabled" do
+      with_http_server do |http, _|
+        header = "PROXY TCP4 10.1.2.3 127.0.0.1 54321 #{http.addr.port}\r\n".to_slice
+        http_whoami_status(http.addr, header).should eq 400
+      end
+    end
+
     it "ignore a PROXY header on HTTP from an untrusted source" do
       with_http_server do |http, _|
         with_proxy_protocol([LavinMQ::IPMatcher.parse("10.0.0.1")]) do
