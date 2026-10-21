@@ -90,6 +90,34 @@ ensure
   socket.try &.close
 end
 
+# GET /api/whoami as the default user, with a PROXY header claiming the client
+# is 127.0.0.1, from the host of a follower that negotiated with *start_header*,
+# so that it counts as from that follower
+private def whoami_from_follower_host(start_header : Bytes) : Int32
+  config = LavinMQ::Config.instance
+  config.clustering = true
+  replicator = LavinMQ::Clustering::Server.new(config, NullCoordinator.new, 0)
+  status = 0
+  with_http_server(replicator: replicator) do |http, _|
+    with_proxy_protocol([LavinMQ::IPMatcher.parse("10.0.0.1")]) do
+      repli_server = TCPServer.new("127.0.0.1", 0)
+      spawn(replicator.listen(repli_server), name: "repli server spec")
+      follower = TCPSocket.new("127.0.0.1", repli_server.local_address.port)
+      follower.write start_header
+      follower.write_byte replicator.password.bytesize.to_u8
+      follower.write replicator.password.to_slice
+      follower.write_bytes 1i32, IO::ByteFormat::LittleEndian
+      follower.read_byte.should eq 0 # authenticated
+      wait_for { replicator.all_followers.size == 1 }
+      status = http_whoami_status(http.addr, proxy_v2_header)
+      follower.close
+    ensure
+      replicator.close
+    end
+  end
+  status
+end
+
 describe "ProxyProtocol" do
   describe "v1" do
     it "can parse valid data" do
@@ -476,6 +504,16 @@ describe "ProxyProtocol" do
         header = "PROXY TCP4 10.1.2.3 127.0.0.1 54321 #{http.addr.port}\r\n".to_slice
         http_whoami_status(http.addr, header).should eq 400
       end
+    end
+
+    it "trust PROXY headers on HTTP from followers on replication protocol version 3" do
+      # The address in the header never counts as loopback, so the default user is refused
+      whoami_from_follower_host(LavinMQ::Clustering::StartV3).should eq 401
+    end
+
+    it "don't trust PROXY headers on HTTP from older followers, which forward a client's" do
+      # The header is ignored, so the default user is on a real loopback connection
+      whoami_from_follower_host(LavinMQ::Clustering::StartV2).should eq 200
     end
 
     it "ignore a PROXY header on HTTP from an untrusted source" do
