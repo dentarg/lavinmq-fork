@@ -405,6 +405,20 @@ describe "ProxyProtocol" do
       conn_info.remote_address.to_s.should eq "1.2.3.4:34567"
     end
 
+    it "doesn't take an HTTP request split after its first byte for a PROXY header" do
+      r, w = IO.pipe
+      ch = Channel(Bool).new
+      spawn { ch.send LavinMQ::ProxyProtocol.header?(r) }
+
+      w.write "P".to_slice # as in both "PROXY" and "POST"
+      Fiber.yield
+      w.write "OST / HTTP/1.1\r\n".to_slice
+
+      ch.receive.should be_false
+      LavinMQ::ProxyProtocol.parse(r).should be_nil
+      r.gets.should eq "POST / HTTP/1.1"
+    end
+
     it "detects a header without reading it" do
       r, w = IO.pipe
       w.write proxy_v2_header

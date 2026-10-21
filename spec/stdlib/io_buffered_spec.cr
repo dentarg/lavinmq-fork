@@ -1,6 +1,7 @@
 require "spec"
 require "../../src/stdlib/io_buffered"
 require "../../src/stdlib/io_buffered_discard"
+require "../../src/stdlib/io_buffered_peek"
 
 describe IO::BufferPool do
   it "reuses released buffers" do
@@ -490,5 +491,54 @@ describe Socket do
       reader.try &.close
       writer.try &.close
     end
+  end
+end
+
+describe "IO::Buffered#peek(size)" do
+  it "reads more after the buffered bytes, without consuming them" do
+    r, w = IO.pipe
+    w.write "ab".to_slice
+    r.peek.should eq "ab".to_slice
+    spawn { w.write "cd".to_slice }
+    r.peek(3).should eq "abcd".to_slice
+    r.gets(4).should eq "abcd"
+  ensure
+    r.try &.close
+    w.try &.close
+  end
+
+  it "moves partly consumed bytes to the start of the buffer" do
+    r, w = IO.pipe
+    w.write "xab".to_slice
+    r.read_byte.should eq 'x'.ord
+    spawn { w.write "cd".to_slice }
+    r.peek(4).should eq "abcd".to_slice
+    r.gets(4).should eq "abcd"
+  ensure
+    r.try &.close
+    w.try &.close
+  end
+
+  it "returns what's buffered at EOF" do
+    r, w = IO.pipe
+    w.write "ab".to_slice
+    w.close
+    r.peek(3).should eq "ab".to_slice
+    r.gets_to_end.should eq "ab"
+  ensure
+    r.try &.close
+  end
+
+  it "works with a pooled socket buffer" do
+    a, b = UNIXSocket.pair
+    b.buffer_pool = IO::BufferPool.for(1024)
+    a.write "ab".to_slice
+    b.peek.should eq "ab".to_slice
+    spawn { a.write "cd".to_slice }
+    b.peek(4).should eq "abcd".to_slice
+    b.gets(4).should eq "abcd"
+  ensure
+    a.try &.close
+    b.try &.close
   end
 end
