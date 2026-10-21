@@ -798,6 +798,18 @@ module FollowerSpec
   end
 
   describe "protocol version" do
+    it "negotiates version 3 from a version 3 header" do
+      with_datadir do |data_dir|
+        follower_socket, client_socket = FakeSocket.pair
+        follower = LavinMQ::Clustering::Follower.new(follower_socket, data_dir, FakeFileIndex.new(data_dir))
+        negotiate(follower, client_socket, LavinMQ::Clustering::StartV3)
+        follower.protocol_version.should eq 3
+      ensure
+        follower_socket.try &.close
+        client_socket.try &.close
+      end
+    end
+
     it "negotiates version 2 from a version 2 header" do
       with_datadir do |data_dir|
         follower_socket, client_socket = FakeSocket.pair
@@ -826,13 +838,13 @@ module FollowerSpec
       with_datadir do |data_dir|
         follower_socket, client_socket = FakeSocket.pair
         follower = LavinMQ::Clustering::Follower.new(follower_socket, data_dir, FakeFileIndex.new(data_dir))
-        client_socket.write Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 3, 0, 0]
+        client_socket.write Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 4, 0, 0]
         expect_raises(LavinMQ::Clustering::InvalidStartHeaderError) do
           follower.negotiate!("foo")
         end
         header = Bytes.new(8)
         client_socket.read_fully(header)
-        header.should eq LavinMQ::Clustering::StartV2
+        header.should eq LavinMQ::Clustering::StartV3
       ensure
         follower_socket.try &.close
         client_socket.try &.close

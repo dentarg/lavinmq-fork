@@ -52,6 +52,8 @@ Replication protocol version 2 carries these synchronization requests, allowing 
 
 Version 1 peers remain compatible. Version 1 connections use the previous behavior: the follower syncs the whole filesystem before each acknowledgment. The protocol version is negotiated automatically.
 
+Version 3 followers check PROXY protocol headers on their HTTP proxies (see [Clustering Proxy](#clustering-proxy)), so the leader only trusts PROXY headers on HTTP from version 3 followers. During a rolling upgrade, older followers' HTTP connections show the follower's address.
+
 Synchronization is enabled by default. Setting `sync=false` in `[main]` (or using `--no-sync`) on a node disables its disk synchronization; replication acknowledgments from that node then do not guarantee disk durability. The leader and each follower use their own configuration. See [Publisher Confirms](publisher-confirms.md#durability-and-synchronization) for the leader's synchronization behavior.
 
 ### What Gets Replicated

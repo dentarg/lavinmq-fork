@@ -203,10 +203,11 @@ module LavinMQ
         slice = buf.to_slice
         @socket.read_fully(slice)
         case slice
+        when StartV3 then @protocol_version = 3
         when StartV2 then @protocol_version = 2
         when Start   then @protocol_version = 1
         else
-          @socket.write(StartV2)
+          @socket.write(StartV3)
           raise InvalidStartHeaderError.new(slice)
         end
       end

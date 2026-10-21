@@ -8,7 +8,11 @@ module LavinMQ
     # Version 2 followers don't sync to disk before every ack; they fsync the
     # files named by fsync request records (a `$` prefixed path and a zero
     # length), and syncfs on a bare `$`.
-    StartV2      = Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 2, 0, 0]
+    StartV2 = Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 2, 0, 0]
+    # Version 3 followers check a client's PROXY header on the HTTP proxies,
+    # forwarding it only from a trusted source, so the leader can trust PROXY
+    # headers on HTTP from them, but not from older followers.
+    StartV3      = Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 3, 0, 0]
     FSYNC_PREFIX = '$'
 
     class Error < Exception; end

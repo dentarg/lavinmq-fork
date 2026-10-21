@@ -55,7 +55,7 @@ module LavinMQ
       @ack_loops = WaitGroup.new
       # Replication protocol version to connect with. Leaders that only speak
       # version 1 don't send fsync requests, so we sync before every ack then.
-      @protocol_version = 2
+      @protocol_version = 3
       # Files this client created whose directory entry isn't fsynced yet,
       # fsynced along with the file when the leader requests it
       @created_files = Set(String).new
@@ -711,8 +711,16 @@ module LavinMQ
         end
       end
 
+      private def start_header : Bytes
+        case @protocol_version
+        when 1 then Start
+        when 2 then StartV2
+        else        StartV3
+        end
+      end
+
       private def authenticate(socket)
-        socket.write(@protocol_version < 2 ? Start : StartV2)
+        socket.write(start_header)
         socket.write_bytes @password.bytesize.to_u8, IO::ByteFormat::LittleEndian
         socket.write @password.to_slice
         case byte = socket.read_byte
@@ -724,9 +732,13 @@ module LavinMQ
           header = Bytes.new(Start.size)
           header[0] = byte
           socket.read_fully(header[1..])
-          if header == Start && @protocol_version > 1
-            Log.warn { "Leader only supports replication protocol version 1, reconnecting with it" }
-            @protocol_version = 1
+          version = case header
+                    when Start   then 1
+                    when StartV2 then 2
+                    end
+          if version && version < @protocol_version
+            Log.warn { "Leader only supports replication protocol version #{version}, reconnecting with it" }
+            @protocol_version = version
             raise IO::Error.new("Replication protocol version mismatch")
           end
           raise Error.new("Unsupported replication protocol: #{String.new(header).inspect}")

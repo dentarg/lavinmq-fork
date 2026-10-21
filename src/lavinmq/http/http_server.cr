@@ -96,11 +96,12 @@ module LavinMQ
         tcp_server.local_address
       end
 
-      # With tcp_proxy_protocol enabled, followers proxy HTTP to the leader unchanged,
-      # except that they only forward PROXY headers from trusted sources
+      # Followers proxy HTTP to the leader unchanged, except that from replication
+      # protocol version 3 they only forward PROXY headers from trusted sources.
+      # Older followers forward a client's PROXY header too, so it's not trusted.
       private def follower?(address : String) : Bool
         return false unless Config.instance.clustering?
-        @server.all_followers.any? { |f| f.remote_address.address == address }
+        @server.all_followers.any? { |f| f.protocol_version >= 3 && f.remote_address.address == address }
       end
 
       def bind_unix(path)
