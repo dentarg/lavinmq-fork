@@ -58,37 +58,38 @@ module LavinMQ
       end
 
       # The PROXY header to put in front of the connection to the leader, if any.
-      # HTTP gets no header of our own, and the leader may read PROXY headers from
-      # us there, depending on its config, so a client's that isn't forwarded is dropped.
+      # A trusted load balancer's PROXY header is forwarded as is instead, so that
+      # the leader, which trusts followers, sees the client's address. Other PROXY
+      # headers from clients are dropped, like the leader would do. HTTP gets no
+      # header of our own, and the leader may read PROXY headers from us there,
+      # depending on its config, so a client's is dropped also then.
       private def leader_proxy_header(client) : ProxyProtocol::V1?
         if client.is_a? TCPSocket
           return if forward_proxy_header?(client)
-          return ProxyProtocol::V1.new(client.remote_address, client.local_address) if @proxy_header
+          if !@proxy_header || Config.instance.tcp_proxy_protocol?
+            drop_proxy_header(client, client.remote_address.to_s)
+          end
+          ProxyProtocol::V1.new(client.remote_address, client.local_address) if @proxy_header
         else
-          return if @unix_proxy_header
+          drop_proxy_header(client, @local_address) unless @unix_proxy_header
         end
-        drop_proxy_header(client)
-        nil
       end
 
-      # A trusted load balancer's PROXY header is forwarded as is, instead of
-      # our own, so that the leader, which trusts followers, sees the client's
-      # address. A header from an untrusted source is dropped, like the leader
-      # would do.
       private def forward_proxy_header?(client : TCPSocket) : Bool
         config = Config.instance
-        return false unless config.tcp_proxy_protocol?
-        return false unless ProxyProtocol.header?(client)
-        return true if config.trusted_proxy_source?(client.remote_address.address)
-        Log.warn { "PROXY protocol from untrusted source #{client.remote_address}, ignoring header" }
-        ProxyProtocol.parse(client)
-        false
+        config.tcp_proxy_protocol? && ProxyProtocol.header?(client) &&
+          config.trusted_proxy_source?(client.remote_address.address)
       end
 
-      private def drop_proxy_header(client) : Nil
+      # Drops one PROXY header. The leader would read a client's next one as the
+      # first from us, so the connection is refused if another follows.
+      private def drop_proxy_header(client, source : String) : Nil
         return unless ProxyProtocol.header?(client)
-        Log.warn { "PROXY protocol on #{@local_address}, ignoring header" }
+        Log.warn { "PROXY protocol from untrusted source #{source}, ignoring header" }
         ProxyProtocol.parse(client)
+        if ProxyProtocol.header?(client)
+          raise ProxyProtocol::Error.new("Another PROXY header from #{source} after an ignored one")
+        end
       end
 
       private def set_socket_opts(socket : TCPSocket)

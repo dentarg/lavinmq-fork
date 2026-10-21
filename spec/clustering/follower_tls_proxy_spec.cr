@@ -136,6 +136,32 @@ ensure
   target.try &.close
 end
 
+# Sends *proxy_header* twice, then a line of data, through a follower's proxy,
+# returns true if the proxy closed the connection rather than forwarding it
+private def refused_by_proxy?(proxy_header : String, header_of_its_own : Bool,
+                              unix_path : String? = nil, unix_proxy_header = true) : Bool
+  target = TCPServer.new("127.0.0.1", 0)
+  proxy = unix_path ? LavinMQ::Clustering::Proxy.new(unix_path) : LavinMQ::Clustering::Proxy.new("127.0.0.1", 0)
+  spawn(name: "proxy spec") do
+    proxy.forward_to("127.0.0.1", target.local_address.port, header_of_its_own, unix_proxy_header)
+  end
+  client = if unix_path
+             UNIXSocket.new(unix_path)
+           else
+             TCPSocket.new("127.0.0.1", proxy.@server.as(TCPServer).local_address.port)
+           end
+  client << proxy_header << proxy_header << "data\r\n"
+  client.flush
+  client.read_timeout = 5.seconds
+  client.read(Bytes.new(1)).zero?
+rescue IO::TimeoutError # forwarded, the leader doesn't answer
+  false
+ensure
+  client.try &.close
+  proxy.try &.close
+  target.try &.close
+end
+
 describe LavinMQ::Clustering::Proxy do
   it "drops a PROXY header from an untrusted source and sends its own" do
     config = LavinMQ::Config.instance
@@ -171,6 +197,25 @@ describe LavinMQ::Clustering::Proxy do
       unix_path: path, unix_proxy_header: false).should eq ["data"]
   ensure
     path.try { |p| File.delete?(p) }
+  end
+
+  it "refuses another PROXY header after dropping one on HTTP" do
+    refused_by_proxy?("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false).should be_true
+  end
+
+  it "refuses another PROXY header after dropping one on the HTTP Unix socket" do
+    path = File.tempname("lavinmq-http", ".sock")
+    refused_by_proxy?("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false,
+      unix_path: path, unix_proxy_header: false).should be_true
+  ensure
+    path.try { |p| File.delete?(p) }
+  end
+
+  it "refuses another PROXY header after dropping one from an untrusted source" do
+    config = LavinMQ::Config.instance
+    config.tcp_proxy_protocol = true
+    config.proxy_protocol_trusted_sources = [LavinMQ::IPMatcher.parse("10.0.0.1")]
+    refused_by_proxy?("PROXY TCP4 10.1.2.3 127.0.0.1 54321 15672\r\n", header_of_its_own: false).should be_true
   end
 
   it "forwards a PROXY header from a client on the AMQP Unix socket" do
