@@ -16,7 +16,11 @@ module LavinMQ
     # the follower its own nonce and its MAC over both, and the leader
     # accepts with its MAC over both, which the follower checks before it
     # sends its id.
-    StartV3        = Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 3, 0, 0]
+    StartV3 = Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 3, 0, 0]
+    # Version 4 is version 3, from a follower that forwards a client's PROXY
+    # header on HTTP only from a trusted source, so the leader can trust PROXY
+    # headers on HTTP from it, but not from older followers.
+    StartV4        = Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 4, 0, 0]
     FSYNC_PREFIX   = '$'
     CHALLENGE_SIZE = 32
     RESPONSE_SIZE  = 32 # HMAC-SHA256
@@ -54,14 +58,25 @@ module LavinMQ
       Follower
     end
 
-    # What *role* answers in the version 3 handshake, a MAC over both sides'
-    # nonces. The role is part of it so one side's answer can't be replayed
-    # as the other's, and the header so neither can be replayed against the
-    # raft port, which uses the same password.
+    # The start header of replication protocol *version*
+    def self.start_header(version : Int32) : Bytes
+      case version
+      when 1 then Start
+      when 2 then StartV2
+      when 3 then StartV3
+      else        StartV4
+      end
+    end
+
+    # What *role* answers in the version 3 and later handshake, a MAC over
+    # both sides' nonces. The role is part of it so one side's answer can't
+    # be replayed as the other's, and the header so neither can be replayed
+    # against the raft port, which uses the same password. The header is the
+    # negotiated version's, so the version can't be changed on the way.
     def self.challenge_response(password : String, role : Role, leader_nonce : Bytes,
-                                follower_nonce : Bytes) : Bytes
+                                follower_nonce : Bytes, header : Bytes = StartV3) : Bytes
       signed = IO::Memory.new
-      signed.write StartV3
+      signed.write header
       signed.write role.to_s.downcase.to_slice
       signed.write leader_nonce
       signed.write follower_nonce

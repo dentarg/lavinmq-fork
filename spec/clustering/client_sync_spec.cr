@@ -1248,14 +1248,14 @@ module ClientSyncSpec
         end
       end
 
-      it "falls back to protocol version 1 when the leader rejects version 3" do
+      it "falls back to protocol version 1 when the leader rejects version 4" do
         with_datadir do |data_dir|
           client = make_client(data_dir)
           client_socket, leader_io = UNIXSocket.pair
           spawn(name: "version 1 leader") do
             header = Bytes.new(8)
             leader_io.read_fully(header)
-            header.should eq LavinMQ::Clustering::StartV3
+            header.should eq LavinMQ::Clustering::StartV4
             leader_io.write LavinMQ::Clustering::Start
           end
           expect_raises(IO::Error, /version mismatch/) do
@@ -1267,14 +1267,14 @@ module ClientSyncSpec
       end
 
       # A 2.11.0-rc.1 leader speaks version 2, where followers send the password
-      it "falls back to protocol version 2, sending the password, when the leader rejects version 3" do
+      it "falls back to protocol version 2, sending the password, when the leader rejects version 4" do
         with_datadir do |data_dir|
           client = make_client(data_dir)
           client_socket, leader_io = UNIXSocket.pair
           spawn(name: "version 2 leader") do
             header = Bytes.new(8)
             leader_io.read_fully(header)
-            header.should eq LavinMQ::Clustering::StartV3
+            header.should eq LavinMQ::Clustering::StartV4
             leader_io.write LavinMQ::Clustering::StartV2
           end
           expect_raises(IO::Error, /version mismatch/) do
@@ -1303,28 +1303,54 @@ module ClientSyncSpec
         end
       end
 
-      it "answers the leader's challenge without sending the password" do
-        with_datadir do |data_dir|
-          client = make_client(data_dir)
-          client_socket, leader_io = UNIXSocket.pair
-          size = LavinMQ::Clustering::CHALLENGE_SIZE
-          nonce = Random::Secure.random_bytes(size)
-          received = Bytes.new(8 + size + LavinMQ::Clustering::RESPONSE_SIZE)
-          spawn(name: "version 3 leader") do
-            leader_io.write LavinMQ::Clustering::StartV3
-            leader_io.write nonce
-            leader_io.read_fully(received)
-            leader_io.write_byte 0u8
-            leader_io.write LavinMQ::Clustering.challenge_response("password", :leader, nonce, received[8, size])
+      {LavinMQ::Clustering::StartV4, LavinMQ::Clustering::StartV3}.each do |start_header|
+        it "answers a version #{start_header[5]} leader's challenge without sending the password" do
+          with_datadir do |data_dir|
+            client = make_client(data_dir)
+            client.protocol_version = start_header[5].to_i32
+            client_socket, leader_io = UNIXSocket.pair
+            size = LavinMQ::Clustering::CHALLENGE_SIZE
+            nonce = Random::Secure.random_bytes(size)
+            received = Bytes.new(8 + size + LavinMQ::Clustering::RESPONSE_SIZE)
+            spawn(name: "version #{start_header[5]} leader") do
+              leader_io.write start_header
+              leader_io.write nonce
+              leader_io.read_fully(received)
+              leader_io.write_byte 0u8
+              leader_io.write LavinMQ::Clustering.challenge_response("password", :leader, nonce, received[8, size], start_header)
+            end
+            client.authenticate_public(client_socket)
+            leader_io.read_bytes(Int32, IO::ByteFormat::LittleEndian).should eq 1
+            received[0, 8].should eq start_header
+            received[8 + size..].should eq LavinMQ::Clustering.challenge_response("password", :follower, nonce, received[8, size], start_header)
+            client.protocol_version.should eq start_header[5]
+          ensure
+            client_socket.try &.close
+            leader_io.try &.close
           end
-          client.authenticate_public(client_socket)
-          leader_io.read_bytes(Int32, IO::ByteFormat::LittleEndian).should eq 1
-          received[0, 8].should eq LavinMQ::Clustering::StartV3
-          received[8 + size..].should eq LavinMQ::Clustering.challenge_response("password", :follower, nonce, received[8, size])
-          client.protocol_version.should eq 3
-        ensure
-          client_socket.try &.close
-          leader_io.try &.close
+        end
+      end
+
+      # A version 3 leader, without the PROXY header checks on HTTP
+      {LavinMQ::ClusteringBackend::Etcd, LavinMQ::ClusteringBackend::Raft}.each do |backend|
+        it "falls back to protocol version 3 when the leader rejects version 4, with the #{backend} backend" do
+          with_datadir do |data_dir|
+            client = make_client(data_dir, backend: backend)
+            client_socket, leader_io = UNIXSocket.pair
+            spawn(name: "version 3 leader") do
+              header = Bytes.new(8)
+              leader_io.read_fully(header)
+              header.should eq LavinMQ::Clustering::StartV4
+              leader_io.write LavinMQ::Clustering::StartV3
+            end
+            expect_raises(IO::Error, /version mismatch/) do
+              client.authenticate_public(client_socket)
+            end
+            client.protocol_version.should eq 3
+          ensure
+            client_socket.try &.close
+            leader_io.try &.close
+          end
         end
       end
 
@@ -1336,7 +1362,7 @@ module ClientSyncSpec
           client_socket, leader_io = UNIXSocket.pair
           size = LavinMQ::Clustering::CHALLENGE_SIZE
           spawn(name: "rogue leader") do
-            leader_io.write LavinMQ::Clustering::StartV3
+            leader_io.write LavinMQ::Clustering::StartV4
             leader_io.write Bytes.new(size)
             leader_io.read_fully(Bytes.new(8 + size + LavinMQ::Clustering::RESPONSE_SIZE))
             leader_io.write_byte 0u8
@@ -1363,12 +1389,12 @@ module ClientSyncSpec
             expect_raises(IO::Error, /version mismatch/) do
               client.authenticate_public(client_socket)
             end
-            client.protocol_version.should eq 3
+            client.protocol_version.should eq 4
             client_socket.close
             leader_io.read_timeout = 1.second
             header = Bytes.new(8)
             leader_io.read_fully(header)
-            header.should eq LavinMQ::Clustering::StartV3
+            header.should eq LavinMQ::Clustering::StartV4
             leader_io.gets_to_end.should be_empty
           ensure
             client_socket.try &.close

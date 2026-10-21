@@ -89,6 +89,8 @@ Replication protocol version 3 adds a challenge-response: instead of sending the
 
 Version 1 and 2 peers, such as 2.11.0-rc.1 nodes, remain compatible, so an etcd cluster can be upgraded one node at a time. They send the password, and version 1 connections use the previous behavior: the follower syncs the whole filesystem before each acknowledgment. The protocol version is negotiated automatically: a follower tries version 3 with each new leader, and falls back to the version an older leader answers with. With the raft backend, where every node speaks version 3, followers never fall back, so the password is never sent.
 
+Version 4 followers check PROXY protocol headers on the HTTP connections they forward (see [Clustering Proxy](#clustering-proxy)), so the leader only trusts PROXY headers on HTTP from version 4 followers. During a rolling upgrade, older followers' HTTP connections show the follower's address.
+
 Synchronization is enabled by default. Setting `sync=false` in `[main]` (or using `--no-sync`) on a node disables its disk synchronization; replication acknowledgments from that node then do not guarantee disk durability. The leader and each follower use their own configuration. See [Publisher Confirms](publisher-confirms.md#durability-and-synchronization) for the leader's synchronization behavior.
 
 ### What Gets Replicated

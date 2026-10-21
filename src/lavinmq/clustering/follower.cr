@@ -203,11 +203,12 @@ module LavinMQ
         slice = buf.to_slice
         @socket.read_fully(slice)
         case slice
+        when StartV4 then @protocol_version = 4
         when StartV3 then @protocol_version = 3
         when StartV2 then @protocol_version = 2
         when Start   then @protocol_version = 1
         else
-          @socket.write(StartV3)
+          @socket.write(StartV4)
           raise InvalidStartHeaderError.new(slice)
         end
       end
@@ -223,14 +224,15 @@ module LavinMQ
       # see StartV3
       private def authenticate_challenge!(password) : Nil
         nonce = Random::Secure.random_bytes(CHALLENGE_SIZE)
-        @socket.write(StartV3 + nonce)
+        header = Clustering.start_header(@protocol_version)
+        @socket.write(header + nonce)
         follower_nonce = Bytes.new(CHALLENGE_SIZE)
         @socket.read_fully(follower_nonce)
         response = Bytes.new(RESPONSE_SIZE)
         @socket.read_fully(response)
-        expected = Clustering.challenge_response(password, :follower, nonce, follower_nonce)
+        expected = Clustering.challenge_response(password, :follower, nonce, follower_nonce, header)
         authenticated!(Crypto::Subtle.constant_time_compare(response, expected))
-        @socket.write Clustering.challenge_response(password, :leader, nonce, follower_nonce)
+        @socket.write Clustering.challenge_response(password, :leader, nonce, follower_nonce, header)
       end
 
       private def authenticated!(ok : Bool) : Nil

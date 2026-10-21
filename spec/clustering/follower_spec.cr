@@ -13,8 +13,9 @@ end
 private def negotiate(follower, client_socket, header) : Nil
   password = "foo"
   client_socket.write header
-  if header == LavinMQ::Clustering::StartV3
-    spawn(name: "answer challenge") { answer_challenge(client_socket, password) }
+  challenge = header.in?(LavinMQ::Clustering::StartV3, LavinMQ::Clustering::StartV4)
+  if challenge
+    spawn(name: "answer challenge") { answer_challenge(client_socket, password, start_header: header) }
   else
     client_socket.write_bytes password.bytesize.to_u8, IO::ByteFormat::LittleEndian
     client_socket.write password.to_slice
@@ -22,26 +23,27 @@ private def negotiate(follower, client_socket, header) : Nil
   end
   follower.negotiate!(password)
   client_socket.read_byte.should eq 0u8
-  if header == LavinMQ::Clustering::StartV3
+  if challenge
     leader_proof = Bytes.new(LavinMQ::Clustering::RESPONSE_SIZE)
     client_socket.read_fully(leader_proof)
-    leader_proof.should eq LavinMQ::Clustering.challenge_response(password, :leader, *ANSWERED_NONCES.pop)
+    leader_nonce, nonce = ANSWERED_NONCES.pop
+    leader_proof.should eq LavinMQ::Clustering.challenge_response(password, :leader, leader_nonce, nonce, header)
   end
 end
 
 # The nonces of each answered challenge, leader's first
 private ANSWERED_NONCES = [] of Tuple(Bytes, Bytes)
 
-private def answer_challenge(client_socket, password, id = 1) : Nil
+private def answer_challenge(client_socket, password, id = 1, start_header = LavinMQ::Clustering::StartV3) : Nil
   header = Bytes.new(8)
   client_socket.read_fully(header)
-  header.should eq LavinMQ::Clustering::StartV3
+  header.should eq start_header
   leader_nonce = Bytes.new(LavinMQ::Clustering::CHALLENGE_SIZE)
   client_socket.read_fully(leader_nonce)
   nonce = Random::Secure.random_bytes(LavinMQ::Clustering::CHALLENGE_SIZE)
   ANSWERED_NONCES << {leader_nonce, nonce}
   client_socket.write nonce
-  client_socket.write LavinMQ::Clustering.challenge_response(password, :follower, leader_nonce, nonce)
+  client_socket.write LavinMQ::Clustering.challenge_response(password, :follower, leader_nonce, nonce, start_header)
   client_socket.write_bytes id, IO::ByteFormat::LittleEndian
 end
 
@@ -823,6 +825,18 @@ module FollowerSpec
   end
 
   describe "protocol version" do
+    it "negotiates version 4 from a version 4 header, with a challenge" do
+      with_datadir do |data_dir|
+        follower_socket, client_socket = FakeSocket.pair
+        follower = LavinMQ::Clustering::Follower.new(follower_socket, data_dir, FakeFileIndex.new(data_dir))
+        negotiate(follower, client_socket, LavinMQ::Clustering::StartV4)
+        follower.protocol_version.should eq 4
+      ensure
+        follower_socket.try &.close
+        client_socket.try &.close
+      end
+    end
+
     it "negotiates version 3 from a version 3 header, with a challenge" do
       with_datadir do |data_dir|
         follower_socket, client_socket = FakeSocket.pair
@@ -880,13 +894,13 @@ module FollowerSpec
       with_datadir do |data_dir|
         follower_socket, client_socket = FakeSocket.pair
         follower = LavinMQ::Clustering::Follower.new(follower_socket, data_dir, FakeFileIndex.new(data_dir))
-        client_socket.write Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 4, 0, 0]
+        client_socket.write Bytes['R'.ord, 'E'.ord, 'P'.ord, 'L'.ord, 'I'.ord, 5, 0, 0]
         expect_raises(LavinMQ::Clustering::InvalidStartHeaderError) do
           follower.negotiate!("foo")
         end
         header = Bytes.new(8)
         client_socket.read_fully(header)
-        header.should eq LavinMQ::Clustering::StartV3
+        header.should eq LavinMQ::Clustering::StartV4
       ensure
         follower_socket.try &.close
         client_socket.try &.close

@@ -124,7 +124,7 @@ module LavinMQ
         follow(host, port)
       end
 
-      PROTOCOL_VERSION = 3
+      PROTOCOL_VERSION = 4
 
       def follow(host : String, port : Int32)
         Log.info { "Following #{host}:#{port}" }
@@ -769,7 +769,7 @@ module LavinMQ
           socket.write_bytes @password.bytesize.to_u8, IO::ByteFormat::LittleEndian
           socket.write @password.to_slice
         else
-          socket.write StartV3
+          socket.write Clustering.start_header(@protocol_version)
           nonces = answer_challenge(socket)
         end
         case byte = socket.read_byte
@@ -788,18 +788,18 @@ module LavinMQ
         socket.write_bytes @id, IO::ByteFormat::LittleEndian
       end
 
-      # A version 3 leader echoes the header followed by its nonce, an older
-      # one rejects it by replying with its own header. Returns the leader's
-      # and our nonce.
+      # A leader that speaks our version echoes the header followed by its
+      # nonce, an older one rejects it by replying with its own header.
+      # Returns the leader's and our nonce.
       private def answer_challenge(socket) : Tuple(Bytes, Bytes)
         header = Bytes.new(StartV3.size)
         socket.read_fully(header)
-        older_leader(header) unless header == StartV3
+        older_leader(header) unless header == Clustering.start_header(@protocol_version)
         leader_nonce = Bytes.new(CHALLENGE_SIZE)
         socket.read_fully(leader_nonce)
         nonce = Random::Secure.random_bytes(CHALLENGE_SIZE)
         socket.write nonce
-        socket.write Clustering.challenge_response(@password, :follower, leader_nonce, nonce)
+        socket.write Clustering.challenge_response(@password, :follower, leader_nonce, nonce, header)
         {leader_nonce, nonce}
       end
 
@@ -809,24 +809,26 @@ module LavinMQ
       private def verify_leader(socket, leader_nonce : Bytes, nonce : Bytes) : Nil
         response = Bytes.new(RESPONSE_SIZE)
         socket.read_fully(response)
-        expected = Clustering.challenge_response(@password, :leader, leader_nonce, nonce)
+        expected = Clustering.challenge_response(@password, :leader, leader_nonce, nonce,
+          Clustering.start_header(@protocol_version))
         return if Crypto::Subtle.constant_time_compare(response, expected)
         raise AuthenticationError.new("The leader doesn't know the clustering password")
       end
 
       # The leader replied with the header of an older version: reconnect
-      # with that version, which sends the password
+      # with that version. Versions 1 and 2 send the password.
       private def older_leader(header : Bytes) : NoReturn
         version =
           case header
+          when StartV3 then 3
           when StartV2 then 2
           when Start   then 1
           else              raise Error.new("Unsupported replication protocol: #{String.new(header).inspect}")
           end
         raise Error.new("Unsupported replication protocol: #{String.new(header).inspect}") if version >= @protocol_version
-        # Raft clusters have no older nodes, so an older "leader" would be
-        # someone trying to get the password in clear text
-        if @config.clustering_backend.raft?
+        # Raft clusters have no nodes older than version 3, so an older
+        # "leader" would be someone trying to get the password in clear text
+        if version < 3 && @config.clustering_backend.raft?
           Log.error { "Leader only supports replication protocol version #{version}, refusing to send it the password" }
           raise IO::Error.new("Replication protocol version mismatch")
         end
