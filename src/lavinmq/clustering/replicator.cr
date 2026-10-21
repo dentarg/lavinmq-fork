@@ -53,6 +53,14 @@ module LavinMQ
         all_followers.any? { |f| Replicator.plain_address(f.remote_address.address) == address }
       end
 
+      # Whether a follower on replication *protocol_version* or later is connected from *address*
+      def follower_address?(address : String, *, protocol_version : Int32) : Bool
+        address = Replicator.plain_address(address)
+        all_followers.any? do |f|
+          f.protocol_version >= protocol_version && Replicator.plain_address(f.remote_address.address) == address
+        end
+      end
+
       # An IPv4 address as a dual-stack listener reports it ("::ffff:10.0.0.2")
       # as an IPv4 listener does ("10.0.0.2"), as the replication and client
       # listeners may be bound differently

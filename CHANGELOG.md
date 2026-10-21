@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- With `tcp_proxy_protocol` enabled, the HTTP and HTTPS listeners read a PROXY header from trusted sources, so the management UI, the HTTP API and WebSocket connections get the client's address. As for AMQP and MQTT, the address never counts as loopback for the default user. Followers forward a trusted load balancer's PROXY header on HTTP and HTTPS, and drop any other from a client
+- With `tcp_proxy_protocol` enabled, the HTTP and HTTPS listeners read a PROXY header from trusted sources, so the management UI, the HTTP API and WebSocket connections get the client's address. As for AMQP and MQTT, the address never counts as loopback for the default user. Followers forward a trusted load balancer's PROXY header on HTTP and HTTPS, and drop any other from a client. The leader only trusts these from followers on the new replication protocol version 4, so not from older followers during a rolling upgrade
 
 ### Changed
 

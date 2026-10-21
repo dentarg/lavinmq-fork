@@ -114,10 +114,11 @@ module LavinMQ
         end
       end
 
-      # Followers forward HTTP to the leader as is, except that they only
-      # forward a PROXY header from a trusted source
+      # Followers forward HTTP to the leader as is, except that from replication
+      # protocol version 4 they only forward a PROXY header from a trusted
+      # source. Older followers forward a client's too, so it's not trusted.
       private def follower?(address : String) : Bool
-        Config.instance.clustering? && @server.follower_address?(address)
+        Config.instance.clustering? && @server.follower_address?(address, protocol_version: 4)
       end
 
       # A client that never completes the handshake mustn't hold the fiber

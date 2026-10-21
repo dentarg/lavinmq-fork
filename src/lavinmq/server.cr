@@ -78,6 +78,11 @@ module LavinMQ
       @replicator.try(&.follower_address?(address)) || false
     end
 
+    # Whether a follower on replication *protocol_version* or later is connected from *address*
+    def follower_address?(address : String, *, protocol_version : Int32) : Bool
+      @replicator.try(&.follower_address?(address, protocol_version: protocol_version)) || false
+    end
+
     def connections : Array(Client)
       @vhosts.values.flat_map(&.connections)
     end
