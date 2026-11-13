@@ -9,6 +9,9 @@ describe LavinMQ::Clustering::Proxy do
     proxy_port = proxy.@server.as(TCPServer).local_address.port
     spawn proxy.forward_to("127.0.0.1", leader.local_address.port)
     client = TCPSocket.new("127.0.0.1", proxy_port)
+    # Clients speak first, and the proxy reads their first bytes, for a PROXY
+    # header, before it connects to the leader
+    client.write "GET / HTTP/1.1\r\n".to_slice
     upstream = leader.accept
     # The leader keeps sending to a client that never reads, until the proxy
     # gives up on the client and closes the connection to the leader too
