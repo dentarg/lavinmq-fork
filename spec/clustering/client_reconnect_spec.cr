@@ -198,10 +198,13 @@ module ClientReconnectSpec
           while socket = leader.accept?
             accepted.send Time.instant # before the handshake the client fails
             begin
-              socket.write LavinMQ::Clustering::StartV3
+              # Echoed, as a leader of the client's version does
+              header = Bytes.new(8)
+              socket.read_fully(header)
+              socket.write header
               socket.write Bytes.new(size)
               # Read all the follower sends, so closing doesn't reset the connection
-              socket.read_fully(Bytes.new(8 + size + LavinMQ::Clustering::RESPONSE_SIZE))
+              socket.read_fully(Bytes.new(size + LavinMQ::Clustering::RESPONSE_SIZE))
               socket.write_byte 0u8
               socket.write Bytes.new(LavinMQ::Clustering::RESPONSE_SIZE) # not the leader's proof
             rescue IO::Error
