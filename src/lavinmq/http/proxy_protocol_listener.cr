@@ -58,6 +58,10 @@ module LavinMQ
       def close : Nil
         @server.close
       end
+
+      def closed? : Bool
+        @server.closed?
+      end
     end
 
     # Reads the PROXY header, and does the TLS handshake, on first use, so in

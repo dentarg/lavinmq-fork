@@ -210,3 +210,202 @@ describe LavinMQ::ClientListeners do
     end
   end
 end
+
+# A follower forwarding its AMQP port, or its HTTP port with *http*, to the
+# leader at *target*, and a client connected to it, on the port's Unix socket
+# with *unix*
+private def with_forwarding(http = false, unix = false, tcp_proxy_protocol = false,
+                            trusted = Array(LavinMQ::IPMatcher).new, & : IO, TCPServer ->) : Nil
+  target = TCPServer.new("127.0.0.1", 0)
+  config = listener_config
+  config.amqps_port = -1
+  config.tcp_proxy_protocol = tcp_proxy_protocol
+  config.proxy_protocol_trusted_sources = trusted
+  path = File.tempname("lavinmq-forward", ".sock")
+  if http
+    config.amqp_port = -1
+    config.http_bind = "127.0.0.1"
+    config.http_port = free_port
+    config.http_unix_path = path if unix
+    port = config.http_port
+  else
+    config.unix_path = path if unix
+    port = config.amqp_port
+  end
+  listeners = SpecListeners.new(config, -> { "127.0.0.1".as(String?) }, {port => target.local_address.port})
+  listeners.bind(nil, nil, nil)
+  listeners.listen
+  client = unix ? UNIXSocket.new(path) : TCPSocket.new("127.0.0.1", port)
+  client.read_timeout = 5.seconds
+  yield client, target
+ensure
+  client.try &.close
+  listeners.try &.close
+  target.try &.close
+  path.try { |p| File.delete?(p) }
+end
+
+# What reaches the leader at *target*, up to the first line that isn't a PROXY header
+private def leader_lines(target : TCPServer) : Array(String)
+  upstream = target.accept
+  upstream.read_timeout = 5.seconds
+  lines = [] of String
+  loop do
+    lines << (line = upstream.gets.to_s)
+    break unless line.starts_with?("PROXY")
+  end
+  lines
+ensure
+  upstream.try &.close
+end
+
+# Connects to *port* over TLS, sending *proxy_header* first, and reads Connection.Start
+private def amqps_start(port, proxy_header : Bytes) : Nil
+  socket = TCPSocket.new("127.0.0.1", port)
+  socket.write proxy_header
+  tls = OpenSSL::SSL::Socket::Client.new(socket, tls_client, sync_close: true)
+  tls.write LavinMQ::AMQP::PROTOCOL_START_0_9_1.to_slice
+  tls.flush
+  tls.read_timeout = 5.seconds
+  frame = Bytes.new(7)
+  tls.read_fully(frame)
+  frame[0].should eq 1u8 # Connection.Start method frame
+ensure
+  tls.try &.close rescue nil
+  socket.try &.close rescue nil
+end
+
+# The status of GET /api/whoami as the default user, sending *proxy_header* first
+private def whoami_status(port, proxy_header : String?) : Int32
+  socket = TCPSocket.new("127.0.0.1", port)
+  socket.read_timeout = 5.seconds
+  socket << proxy_header if proxy_header
+  socket << "GET /api/whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n" \
+            "Authorization: Basic #{Base64.strict_encode("guest:guest")}\r\n\r\n"
+  socket.flush
+  HTTP::Client::Response.from_io(socket, ignore_body: true).status_code
+ensure
+  socket.try &.close
+end
+
+describe LavinMQ::ClientListeners do
+  describe "forwarding PROXY headers to the leader" do
+    header = "PROXY TCP4 10.1.2.3 127.0.0.1 54321 5672\r\n"
+    only_10_0_0_1 = [LavinMQ::IPMatcher.parse("10.0.0.1")]
+
+    it "drops an untrusted one on AMQP and sends its own" do
+      with_forwarding(tcp_proxy_protocol: true, trusted: only_10_0_0_1) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        lines = leader_lines(target)
+        lines.size.should eq 2
+        lines[0].should match /^PROXY TCP4 127\.0\.0\.1 127\.0\.0\.1 \d+ \d+$/
+        lines[1].should eq "data"
+      end
+    end
+
+    it "forwards a trusted load balancer's on AMQP instead of its own" do
+      with_forwarding(tcp_proxy_protocol: true) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        leader_lines(target).should eq [header.chomp, "data"]
+      end
+    end
+
+    it "forwards a trusted load balancer's on HTTP" do
+      with_forwarding(http: true, tcp_proxy_protocol: true) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        leader_lines(target).should eq [header.chomp, "data"]
+      end
+    end
+
+    it "drops an untrusted one on HTTP" do
+      with_forwarding(http: true, tcp_proxy_protocol: true, trusted: only_10_0_0_1) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        leader_lines(target).should eq ["data"]
+      end
+    end
+
+    # tcp_proxy_protocol is set per node, the leader may read them from followers
+    it "drops a client's on HTTP with tcp_proxy_protocol disabled" do
+      with_forwarding(http: true) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        leader_lines(target).should eq ["data"]
+      end
+    end
+
+    it "drops a client's on the HTTP Unix socket" do
+      with_forwarding(http: true, unix: true, tcp_proxy_protocol: true) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        leader_lines(target).should eq ["data"]
+      end
+    end
+
+    # The leader's AMQP Unix socket reads them too
+    it "forwards a client's on the AMQP Unix socket" do
+      with_forwarding(unix: true, tcp_proxy_protocol: true) do |client, target|
+        client << header << "data\r\n"
+        client.flush
+        leader_lines(target).should eq [header.chomp, "data"]
+      end
+    end
+
+    it "closes the connection when another follows a dropped one" do
+      with_forwarding(http: true, tcp_proxy_protocol: true, trusted: only_10_0_0_1) do |client, _target|
+        client << header << header << "data\r\n"
+        client.flush
+        client.read(Bytes.new(1)).should eq 0
+      end
+    end
+
+    it "lets the leader see a trusted load balancer's client in front of TLS" do
+      with_amqp_server(extra_tls_listener: true) do |s|
+        with_proxy_protocol do
+          config = listener_config
+          config.tcp_proxy_protocol = true
+          listeners = SpecListeners.new(config, -> { "localhost".as(String?) },
+            {config.amqps_port => amqp_tls_port(s)})
+          listeners.bind(tls_context, nil, nil)
+          listeners.listen
+          Log.capture("lmq.server", :info) do |logs|
+            # PROXY v2 from 10.1.2.3:54321 with an AUTHORITY TLV, as a load balancer passing TLS through sends it
+            v2 = IO::Memory.new
+            v2.write LavinMQ::ProxyProtocol::V2::Signature.to_slice
+            v2.write Bytes[0x21, 0x11, 0x00, 0x13, 10, 1, 2, 3, 127, 0, 0, 1, 0xd4, 0x31, 0x16, 0x27]
+            v2.write Bytes[0x02, 0x00, 0x04]
+            v2.write "host".to_slice
+            amqps_start(config.amqps_port, v2.to_slice)
+            logs.check(:info, /^10\.1\.2\.3:54321 connected with /)
+          end
+        ensure
+          listeners.try &.close
+        end
+      end
+    end
+  end
+
+  it "hands HTTP to the broker with the client's address from a trusted PROXY header" do
+    with_amqp_server do |s|
+      with_proxy_protocol do
+        config = listener_config
+        config.amqp_port = config.amqps_port = -1
+        config.http_bind = "127.0.0.1"
+        config.http_port = free_port
+        listeners = LavinMQ::ClientListeners.new(config, -> { nil.as(String?) })
+        listeners.bind(nil, nil, nil)
+        listeners.listen
+        listeners.serve(LavinMQ::ClientListeners::Brokers.new(s.amqp_server, s.mqtt_server, s.http_server))
+        # The default user may only log in from loopback, and an address from
+        # a PROXY header never counts as loopback
+        whoami_status(config.http_port, "PROXY TCP4 127.0.0.1 127.0.0.1 54321 15672\r\n").should eq 401
+        whoami_status(config.http_port, nil).should eq 200
+      ensure
+        listeners.try &.close
+      end
+    end
+  end
+end

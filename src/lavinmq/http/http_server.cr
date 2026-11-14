@@ -91,7 +91,7 @@ module LavinMQ
         return client.close unless open
         spawn(name: "HTTP client") do
           client.sync = false
-          io = tls ? OpenSSL::SSL::Socket::Server.new(client, tls, sync_close: true) : client
+          io = client_io(client, tls)
           # process(io, io) wraps the IO from Crystal 1.22, losing the remote
           # address, e.g. for the loopback-only default user
           {% if compare_versions(Crystal::VERSION, "1.22.0") >= 0 %}
@@ -108,6 +108,23 @@ module LavinMQ
         end
       end
 
+      # With tcp_proxy_protocol enabled a connection may start with a PROXY
+      # header, read before the TLS handshake, in the connection's fiber, see
+      # ProxiedConnection
+      private def client_io(client : Socket, tls : OpenSSL::SSL::Context::Server?) : IO
+        if client.is_a?(TCPSocket) && Config.instance.tcp_proxy_protocol?
+          ProxiedConnection.new(client, tls, ->trusted_proxy_source?(String))
+        elsif tls
+          OpenSSL::SSL::Socket::Server.new(client, tls, sync_close: true)
+        else
+          client
+        end
+      end
+
+      private def trusted_proxy_source?(address : String) : Bool
+        Config.instance.trusted_proxy_source?(address) || follower?(address)
+      end
+
       def bind_tcp(address, port)
         addr = bind_listener(address, port, nil)
         Log.info { "Bound to #{addr}" }
@@ -122,8 +139,7 @@ module LavinMQ
 
       private def bind_listener(address, port, tls_context) : ::Socket::IPAddress
         tcp = HTTP.tcp_listener(address, port) do |tcp_server|
-          @http.bind ProxyProtocolListener.new(tcp_server, tls_context,
-            ->(addr : String) { Config.instance.trusted_proxy_source?(addr) || follower?(addr) })
+          @http.bind ProxyProtocolListener.new(tcp_server, tls_context, ->trusted_proxy_source?(String))
         end
         tcp.local_address
       end

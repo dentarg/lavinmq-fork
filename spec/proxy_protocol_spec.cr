@@ -89,6 +89,10 @@ end
 # GET /api/whoami as the default user, with a PROXY header claiming the client
 # is 127.0.0.1, from the host of a follower that negotiated with *start_header*,
 # so that it counts as from that follower
+private def connection_addresses(s : LavinMQ::Server) : Array(String)
+  s.connections.compact_map(&.as?(LavinMQ::AMQP::Client)).map(&.connection_info.remote_address.to_s)
+end
+
 # Answers the leader's challenge as a follower on replication protocol version 3 or later
 private def answer_replication_challenge(follower : IO, password : String, start_header : Bytes) : Nil
   header = Bytes.new(start_header.size)

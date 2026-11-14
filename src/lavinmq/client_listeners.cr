@@ -188,21 +188,15 @@ module LavinMQ
         return client.close
       end
       return client.close unless track(client)
+      set_socket_options(client) if client.is_a?(TCPSocket)
+      header = leader_proxy_header(l, client)
       target = TCPSocket.new(host, port, connect_timeout: CONNECT_TIMEOUT)
       set_socket_options(target)
       # A client that stops reading must not keep the connection open: the
       # copy from the leader would block in its write forever, and never see
       # that the leader closed the connection after its own tcp_send_timeout
       client.write_timeout = @config.tcp_send_timeout.seconds
-      if client.is_a?(TCPSocket)
-        set_socket_options(client)
-        # The leader parses it from followers, also before TLS, but HTTP has
-        # no place for it
-        unless l.kind.http?
-          header = ProxyProtocol::V1.new(client.remote_address, client.local_address)
-          target.write_bytes header, IO::ByteFormat::NetworkEndian
-        end
-      end
+      target.write_bytes header, IO::ByteFormat::NetworkEndian if header
       spawn(name: "Forward #{l.kind} from the leader") do
         IO.copy(target, client)
       rescue IO::Error
@@ -211,12 +205,49 @@ module LavinMQ
         client.close rescue nil
       end
       IO.copy(client, target)
+    rescue ex : ProxyProtocol::Error | ArgumentError
+      Log.warn { "Invalid PROXY header on #{l.address}: #{ex.message}" }
     rescue ex : IO::Error | Socket::Error
       Log.debug { "Forwarding a #{l.kind} connection to #{host}: #{ex.message}" }
     ensure
       target.try &.close rescue nil
       client.close rescue nil
       @lock.synchronize { @forwarded.delete(client) }
+    end
+
+    # The PROXY header to send the leader first, if any. The leader trusts
+    # PROXY headers from followers, on AMQP and MQTT from all of them, also in
+    # front of TLS, and on HTTP from those on replication protocol version 4,
+    # which this check is. So a trusted load balancer's header is forwarded as
+    # is instead of our own, for the leader to see the load balancer's client,
+    # and other PROXY headers from clients are dropped where the leader would
+    # read them. HTTP has no place for one of our own.
+    private def leader_proxy_header(l : Listener, client : Socket) : ProxyProtocol::V1?
+      if client.is_a?(TCPSocket)
+        return if forward_proxy_header?(client)
+        drop_proxy_header(client, client.remote_address.to_s) if l.kind.http? || @config.tcp_proxy_protocol?
+        ProxyProtocol::V1.new(client.remote_address, client.local_address) unless l.kind.http?
+      elsif l.kind.http?
+        # A client on the AMQP and MQTT Unix sockets may send one, as the
+        # leader's read them, but the leader's HTTP Unix socket doesn't
+        drop_proxy_header(client, l.address)
+      end
+    end
+
+    private def forward_proxy_header?(client : TCPSocket) : Bool
+      @config.tcp_proxy_protocol? && ProxyProtocol.header?(client) &&
+        @config.trusted_proxy_source?(client.remote_address.address)
+    end
+
+    # Drops one PROXY header. The leader would read a client's next one as the
+    # first from us, so the connection is refused if another follows.
+    private def drop_proxy_header(client : Socket, source : String) : Nil
+      return unless ProxyProtocol.header?(client)
+      Log.warn { "PROXY protocol from untrusted source #{source}, ignoring header" }
+      ProxyProtocol.parse(client)
+      if ProxyProtocol.header?(client)
+        raise ProxyProtocol::Error.new("Another PROXY header from #{source} after an ignored one")
+      end
     end
 
     # The leader's port of the same kind and TLS as *l*, it uses the same
