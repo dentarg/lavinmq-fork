@@ -241,6 +241,20 @@ describe "ProxyProtocol" do
   end
 
   describe "auto-detection" do
+    it "doesn't take an HTTP request split after its first byte for a PROXY header" do
+      r, w = IO.pipe
+      ch = Channel(Bool).new
+      spawn { ch.send LavinMQ::ProxyProtocol.header?(r) }
+
+      w.write "P".to_slice # as in both "PROXY" and "POST"
+      Fiber.yield
+      w.write "OST / HTTP/1.1\r\n".to_slice
+
+      ch.receive.should be_false
+      LavinMQ::ProxyProtocol.read(r).should be_nil
+      r.gets.should eq "POST / HTTP/1.1"
+    end
+
     it "auto-detects V1 protocol" do
       r, w = IO.pipe
       w.write "PROXY TCP4 1.2.3.4 127.0.0.2 34567 1234\r\n".to_slice

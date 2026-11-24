@@ -2,6 +2,7 @@ require "socket"
 require "log"
 require "./connection_info"
 require "./config"
+require "../stdlib/io_buffered_peek"
 
 module LavinMQ
   # https://raw.githubusercontent.com/haproxy/haproxy/master/doc/proxy-protocol.txt
@@ -29,19 +30,49 @@ module LavinMQ
     # start with one
     def self.read(io : IO, timeout : Time::Span = HANDSHAKE_TIMEOUT) : (V1 | V2)?
       io.read_timeout = timeout
-      # A single peek can return fewer bytes than the full signature on a TCP
-      # segment split (issue 2082), so we only need the bytes we have to match
-      # the *start* of a signature. No supported protocol (AMQP "AMQP\0\0\9\1",
-      # MQTT, HTTP) begins with "PROXY" or the V2 signature, so a prefix match
-      # is unambiguous; the V1/V2 parsers then read the rest of the header.
-      peeked = io.peek
-      if header_prefix?(peeked, "PROXY".to_slice)
-        V1.from_io(io)
-      elsif header_prefix?(peeked, V2::Signature.to_slice)
-        V2.from_io(io)
+      case signature(io)
+      when V1_SIGNATURE then V1.from_io(io)
+      when V2_SIGNATURE then V2.from_io(io)
       end
     ensure
       io.read_timeout = nil
+    end
+
+    # True if *io* starts with a PROXY header, which is left unread
+    def self.header?(io : IO, timeout : Time::Span = HANDSHAKE_TIMEOUT) : Bool
+      io.read_timeout = timeout
+      !signature(io).nil?
+    ensure
+      io.read_timeout = nil
+    end
+
+    private V1_SIGNATURE = "PROXY".to_slice
+    private V2_SIGNATURE = V2::Signature.to_slice
+
+    # The signature *io* starts with, if any. A peek can end in the middle of a
+    # signature, as a TCP segment can (issue 2082), and then be the start of
+    # something else too: "P" starts both "PROXY" and an HTTP "POST", "PUT" or
+    # "PATCH". So it peeks further, without consuming anything, until the bytes
+    # differ from the signatures or a whole signature has arrived.
+    private def self.signature(io) : Bytes?
+      peeked = io.peek || return
+      loop do
+        {V1_SIGNATURE, V2_SIGNATURE}.each do |signature|
+          return signature if peeked.size >= signature.size && peeked[0, signature.size] == signature
+        end
+        return unless start_of_signature?(peeked)
+        more = io.peek(peeked.size + 1)
+        return if more.size == peeked.size # EOF
+        peeked = more
+      end
+    end
+
+    # True if *peeked* is the start of a signature, but shorter than it
+    private def self.start_of_signature?(peeked : Bytes) : Bool
+      return false if peeked.empty?
+      {V1_SIGNATURE, V2_SIGNATURE}.any? do |signature|
+        peeked.size < signature.size && peeked == signature[0, peeked.size]
+      end
     end
 
     # Reads a PROXY header, v1 or v2, and returns it if the source may send
@@ -57,14 +88,6 @@ module LavinMQ
         return
       end
       header unless header.local?
-    end
-
-    # True if the bytes seen so far match the start of *signature* (comparing
-    # only the bytes we have, since a segment split may give us a partial peek).
-    private def self.header_prefix?(peeked : Bytes, signature : Bytes) : Bool
-      n = Math.min(peeked.size, signature.size)
-      return false if n.zero?
-      peeked[0, n] == signature[0, n]
     end
 
     struct V1
