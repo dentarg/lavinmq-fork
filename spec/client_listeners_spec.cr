@@ -114,6 +114,65 @@ end
 private LB_V1_HEADER  = "PROXY TCP4 203.0.113.7 10.0.0.1 40000 5672\r\n"
 private OWN_V1_HEADER = /\APROXY TCP4 127\.0\.0\.1 127\.0\.0\.1 (\d+) \d+\r\n\z/
 
+private HTTP_REQUEST_LINE = "GET / HTTP/1.1\r\n"
+
+# Sends *payload* and an HTTP request line through a follower's HTTP port, or
+# its HTTP Unix socket with *unix*, to a fake leader. Returns what the leader
+# got in front of the request line, or nil if the follower closed the
+# connection instead of forwarding it.
+private def forward_http_through_follower(payload : Bytes, *, tcp_proxy_protocol = true, trusted = "",
+                                          unix = false) : Bytes?
+  config = listener_config
+  config.amqp_port = config.amqps_port = -1
+  config.http_bind = "127.0.0.1"
+  config.http_port = free_port
+  path = File.tempname("lavinmq-http", ".sock")
+  config.http_unix_path = path if unix
+  config.tcp_proxy_protocol = tcp_proxy_protocol
+  config.proxy_protocol_trusted_sources = LavinMQ::IPMatcher.parse_list(trusted) unless trusted.empty?
+  leader = TCPServer.new("127.0.0.1", 0)
+  listeners = LavinMQ::ClientListeners.new(config, -> { leader_at("127.0.0.1", {"http" => leader.local_address.port}) })
+  listeners.bind(nil, nil, nil)
+  listeners.listen
+  client = unix ? UNIXSocket.new(path) : TCPSocket.new("127.0.0.1", config.http_port)
+  client.write payload
+  client << HTTP_REQUEST_LINE
+  client.flush
+  accepted = Channel(TCPSocket?).new(1)
+  spawn(name: "fake leader") { accepted.send leader.accept? }
+  closed = Channel(Nil).new(1)
+  spawn(name: "follower closes") do
+    client.read_timeout = 5.seconds
+    client.read(Bytes.new(1)) # the leader never answers, so 0 is a close
+    closed.send nil
+  rescue IO::Error
+  end
+  select
+  when upstream = accepted.receive
+    upstream = upstream.not_nil!
+    upstream.read_timeout = 5.seconds
+    received = IO::Memory.new
+    buf = Bytes.new(256)
+    request = HTTP_REQUEST_LINE.to_slice
+    until received.size >= request.size && received.to_slice[-request.size..] == request
+      n = upstream.read(buf)
+      raise "Leader connection closed" if n.zero?
+      received.write buf[0, n]
+    end
+    received.to_slice[0, received.size - request.size]
+  when closed.receive
+    nil
+  when timeout(5.seconds)
+    raise "Neither forwarded nor closed"
+  end
+ensure
+  client.try &.close rescue nil
+  upstream.try &.close rescue nil
+  listeners.try &.close
+  leader.try &.close
+  path.try { |p| File.delete?(p) }
+end
+
 private def proxied_connections(s : LavinMQ::Server) : Array(Bool)
   s.connections.map { |c| c.as(LavinMQ::AMQP::Client).connection_info.proxied? }
 end
@@ -278,6 +337,37 @@ describe LavinMQ::ClientListeners do
       conn_info = v2.to_conn_info.should_not be_nil
       conn_info.remote_address.to_s.should eq "203.0.113.7:40000"
       conn_info.ssl_cipher.should_not eq "lb-cipher"
+    end
+  end
+
+  describe "PROXY headers on HTTP" do
+    it "sends no header of its own" do
+      forward_http_through_follower(Bytes.empty).not_nil!.should be_empty
+    end
+
+    it "forwards a trusted load balancer's header as is" do
+      forward_http_through_follower(LB_V1_HEADER.to_slice).not_nil!.should eq LB_V1_HEADER.to_slice
+    end
+
+    it "drops an untrusted one" do
+      forward_http_through_follower(LB_V1_HEADER.to_slice, trusted: "10.9.9.9").not_nil!.should be_empty
+    end
+
+    # tcp_proxy_protocol is set per node, the leader may read them from followers
+    it "drops a client's with tcp_proxy_protocol disabled" do
+      forward_http_through_follower(LB_V1_HEADER.to_slice, tcp_proxy_protocol: false).not_nil!.should be_empty
+    end
+
+    # The leader's own HTTP Unix socket doesn't read them
+    it "drops a client's on the HTTP Unix socket" do
+      forward_http_through_follower(LB_V1_HEADER.to_slice, unix: true).not_nil!.should be_empty
+    end
+
+    # The leader would read the next one as the follower's
+    it "closes the connection when another follows a dropped one" do
+      twice = (LB_V1_HEADER * 2).to_slice
+      forward_http_through_follower(twice, trusted: "10.9.9.9").should be_nil
+      forward_http_through_follower(twice, tcp_proxy_protocol: false).should be_nil
     end
   end
 

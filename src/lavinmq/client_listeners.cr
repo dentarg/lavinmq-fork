@@ -225,15 +225,18 @@ module LavinMQ
     end
 
     private def forward(l : Listener, client : Socket, host : String, port : Int32) : Nil
-      # The leader parses it from followers, but HTTP has no place for it
+      # The leader parses it from followers, but HTTP has no place for one of our own
       tcp_client = client.as?(TCPSocket) unless l.kind.http?
       # A load balancer's header comes before TLS
       inbound = inbound_proxy_header(tcp_client) if tcp_client
+      http_header = http_proxy_header(l, client) if l.kind.http?
       downstream = terminate_tls(l, client)
       target = TCPSocket.new(host, port, connect_timeout: CONNECT_TIMEOUT)
       set_socket_options(target)
       if tcp_client
         target.write_bytes proxy_header(tcp_client, inbound, downstream), IO::ByteFormat::NetworkEndian
+      elsif http_header
+        target.write_bytes http_header, IO::ByteFormat::NetworkEndian
       end
       spawn(name: "Forward #{l.kind} from the leader") do
         IO.copy(target, downstream)
@@ -265,6 +268,33 @@ module LavinMQ
 
     # The TLS session with the client, or the client itself when *l* is
     # plaintext or passes TLS through
+    # HTTP gets no PROXY header of ours, but the leader reads one from
+    # followers on replication protocol version 4, see HTTP::Server. So a
+    # trusted load balancer's header is forwarded as is, and any other PROXY
+    # header from a client is dropped: also with tcp_proxy_protocol disabled
+    # here, as the leader may have it enabled, and on the HTTP Unix socket,
+    # where the leader's own doesn't read them. The leader would read a
+    # client's next header as the first, so the connection is refused if
+    # another follows one that was dropped.
+    private def http_proxy_header(l : Listener, client : Socket) : (ProxyProtocol::V1 | ProxyProtocol::V2)?
+      # See #inbound_proxy_header
+      client.buffer_size = 128
+      tcp = client.as?(TCPSocket)
+      if tcp && @config.tcp_proxy_protocol?
+        header = ProxyProtocol.read_trusted(tcp, tcp.remote_address, @config, Log)
+        return header if header
+        source = tcp.remote_address.to_s
+      else
+        return unless ProxyProtocol.header?(client)
+        source = tcp.try(&.remote_address.to_s) || l.address
+        Log.warn { "PROXY protocol from untrusted source #{source}, ignoring header" }
+        ProxyProtocol.read(client)
+      end
+      if ProxyProtocol.header?(client)
+        raise ProxyProtocol::Error.new("Another PROXY header from #{source} after an ignored one")
+      end
+    end
+
     private def terminate_tls(l : Listener, client : Socket) : IO
       tls = l.tls
       return client if tls.nil? || l.tls_passthrough
