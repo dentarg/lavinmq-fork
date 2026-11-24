@@ -116,6 +116,22 @@ private OWN_V1_HEADER = /\APROXY TCP4 127\.0\.0\.1 127\.0\.0\.1 (\d+) \d+\r\n\z/
 
 private HTTP_REQUEST_LINE = "GET / HTTP/1.1\r\n"
 
+# What the leader got in front of the HTTP request line
+private def before_request_line(upstream : IO) : Bytes
+  upstream.read_timeout = 5.seconds
+  received = IO::Memory.new
+  buf = Bytes.new(256)
+  request = HTTP_REQUEST_LINE.to_slice
+  until received.size >= request.size && received.to_slice[-request.size..] == request
+    n = upstream.read(buf)
+    raise "Leader connection closed" if n.zero?
+    received.write buf[0, n]
+  end
+  received.to_slice[0, received.size - request.size]
+ensure
+  upstream.close rescue nil
+end
+
 # Sends *payload* and an HTTP request line through a follower's HTTP port, or
 # its HTTP Unix socket with *unix*, to a fake leader. Returns what the leader
 # got in front of the request line, or nil if the follower closed the
@@ -149,17 +165,7 @@ private def forward_http_through_follower(payload : Bytes, *, tcp_proxy_protocol
   end
   select
   when upstream = accepted.receive
-    upstream = upstream.not_nil!
-    upstream.read_timeout = 5.seconds
-    received = IO::Memory.new
-    buf = Bytes.new(256)
-    request = HTTP_REQUEST_LINE.to_slice
-    until received.size >= request.size && received.to_slice[-request.size..] == request
-      n = upstream.read(buf)
-      raise "Leader connection closed" if n.zero?
-      received.write buf[0, n]
-    end
-    received.to_slice[0, received.size - request.size]
+    upstream ? before_request_line(upstream) : raise "Leader stopped listening"
   when closed.receive
     nil
   when timeout(5.seconds)
@@ -167,7 +173,6 @@ private def forward_http_through_follower(payload : Bytes, *, tcp_proxy_protocol
   end
 ensure
   client.try &.close rescue nil
-  upstream.try &.close rescue nil
   listeners.try &.close
   leader.try &.close
   path.try { |p| File.delete?(p) }
@@ -342,25 +347,25 @@ describe LavinMQ::ClientListeners do
 
   describe "PROXY headers on HTTP" do
     it "sends no header of its own" do
-      forward_http_through_follower(Bytes.empty).not_nil!.should be_empty
+      forward_http_through_follower(Bytes.empty).should eq Bytes.empty
     end
 
     it "forwards a trusted load balancer's header as is" do
-      forward_http_through_follower(LB_V1_HEADER.to_slice).not_nil!.should eq LB_V1_HEADER.to_slice
+      forward_http_through_follower(LB_V1_HEADER.to_slice).should eq LB_V1_HEADER.to_slice
     end
 
     it "drops an untrusted one" do
-      forward_http_through_follower(LB_V1_HEADER.to_slice, trusted: "10.9.9.9").not_nil!.should be_empty
+      forward_http_through_follower(LB_V1_HEADER.to_slice, trusted: "10.9.9.9").should eq Bytes.empty
     end
 
     # tcp_proxy_protocol is set per node, the leader may read them from followers
     it "drops a client's with tcp_proxy_protocol disabled" do
-      forward_http_through_follower(LB_V1_HEADER.to_slice, tcp_proxy_protocol: false).not_nil!.should be_empty
+      forward_http_through_follower(LB_V1_HEADER.to_slice, tcp_proxy_protocol: false).should eq Bytes.empty
     end
 
     # The leader's own HTTP Unix socket doesn't read them
     it "drops a client's on the HTTP Unix socket" do
-      forward_http_through_follower(LB_V1_HEADER.to_slice, unix: true).not_nil!.should be_empty
+      forward_http_through_follower(LB_V1_HEADER.to_slice, unix: true).should eq Bytes.empty
     end
 
     # The leader would read the next one as the follower's
