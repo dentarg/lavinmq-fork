@@ -1,3 +1,4 @@
+require "log/spec"
 require "./spec_helper"
 require "../src/lavinmq/proxy_protocol"
 
@@ -473,6 +474,24 @@ describe "ProxyProtocol" do
     ensure
       ssl_client.try &.close rescue nil
       tcp_client.try &.close rescue nil
+    end
+  end
+
+  # Invalid addresses, a truncated v2 header or nothing at all before the
+  # timeout each raise something else than a ProxyProtocol::Error
+  {"PROXY TCP4 a b 1 2\r\n", "PROXY TCP4 1.2.3.4 127.0.0.1 99999 5671\r\n"}.each do |header|
+    it "logs an invalid PROXY header in front of TLS as a warning: #{header.inspect}" do
+      with_amqp_server(tls: true) do |s|
+        s.@config.tcp_proxy_protocol = true
+        Log.capture("lmq.server", :warn) do |logs|
+          socket = TCPSocket.new("localhost", amqp_tls_port(s))
+          socket.write header.to_slice
+          socket.read_timeout = 5.seconds
+          socket.read(Bytes.new(1)).should eq 0 # closed by the server
+          socket.close
+          logs.check(:warn, /^Error accepting TLS connection from /)
+        end
+      end
     end
   end
 end
