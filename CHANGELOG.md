@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- With `tcp_proxy_protocol` enabled, the HTTP and HTTPS listeners read a PROXY header from trusted sources, so the management UI, the HTTP API and WebSocket connections get the client's address. As for AMQP and MQTT, the address never counts as loopback for the default user
+
 ### Changed
 
 - A `SIGHUP` config reload now applies changes to `auth_backends`, enabling or disabling OAuth (and local) authentication, and to the `[oauth]` `issuer` and `jwks_cache_ttl`, fetching keys from the new issuer, including for token refreshes on existing connections. An unsupported `auth_backends` value is now rejected when the config is parsed [#2451](https://github.com/cloudamqp/lavinmq/pull/2451)

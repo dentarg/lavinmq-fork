@@ -2,6 +2,7 @@ require "http/server/handler"
 require "http/web_socket"
 require "../../connection_info"
 require "../../config"
+require "../proxy_protocol_listener"
 require "../../../stdlib/socket_shutdown"
 
 module LavinMQ
@@ -91,9 +92,12 @@ module LavinMQ
 
         local_address = req.local_address.as?(Socket::IPAddress) ||
                         Socket::IPAddress.new("127.0.0.1", 0) # Fake when UNIXAddress
-        remote_address = req.remote_address.as?(Socket::IPAddress) ||
-                         Socket::IPAddress.new("127.0.0.1", 0) # Fake when UNIXAddress
-        connection_info = ConnectionInfo.new(remote_address, local_address)
+        remote_address, proxied = case addr = req.remote_address
+                                  when HTTP::ProxiedAddress then {addr.address, true}
+                                  when Socket::IPAddress    then {addr, false}
+                                  else                           {Socket::IPAddress.new("127.0.0.1", 0), false} # Fake when UNIXAddress
+                                  end
+        connection_info = ConnectionInfo.new(remote_address, local_address, proxied: proxied)
 
         case protocol
         in .mqtt?

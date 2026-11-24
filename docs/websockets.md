@@ -40,4 +40,4 @@ From the protocol handler's perspective, the connection behaves identically to a
 
 ## Client IP
 
-The client's remote IP address is taken from the HTTP request's TCP connection.
+The client's remote IP address is taken from the HTTP request's TCP connection, or, with `tcp_proxy_protocol` enabled, from a PROXY header from a trusted source. See [Proxy Protocol](connections.md#proxy-protocol).

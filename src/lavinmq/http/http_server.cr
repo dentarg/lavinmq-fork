@@ -4,6 +4,7 @@ require "../../stdlib/http_server"
 require "json"
 require "./constants"
 require "./listener"
+require "./proxy_protocol_listener"
 require "./handler/*"
 require "./controller"
 require "./controller/*"
@@ -84,7 +85,7 @@ module LavinMQ
         return client.close unless open
         spawn(name: "HTTP client") do
           client.sync = false
-          io = tls ? tls_handshake(client, tls) : client
+          io = client_io(client, tls)
           # process(io, io) wraps the IO from Crystal 1.22, losing the remote
           # address, e.g. for the loopback-only default user
           {% if compare_versions(Crystal::VERSION, "1.22.0") >= 0 %}
@@ -101,6 +102,24 @@ module LavinMQ
         end
       end
 
+      # With tcp_proxy_protocol enabled a connection may start with a PROXY
+      # header, read before the TLS handshake, in this fiber, see ProxiedConnection
+      private def client_io(client : Socket, tls : OpenSSL::SSL::Context::Server?) : IO
+        if client.is_a?(TCPSocket) && Config.instance.tcp_proxy_protocol?
+          ProxiedConnection.new(client, tls, ->follower?(String))
+        elsif tls
+          tls_handshake(client, tls)
+        else
+          client
+        end
+      end
+
+      # Followers forward HTTP to the leader as is, except that they only
+      # forward a PROXY header from a trusted source
+      private def follower?(address : String) : Bool
+        Config.instance.clustering? && @server.follower_address?(address)
+      end
+
       # A client that never completes the handshake mustn't hold the fiber
       private def tls_handshake(client : Socket, tls : OpenSSL::SSL::Context::Server) : OpenSSL::SSL::Socket::Server
         client.read_timeout = ProxyProtocol::HANDSHAKE_TIMEOUT
@@ -110,18 +129,21 @@ module LavinMQ
       end
 
       def bind_tcp(address, port)
-        tcp = HTTP.tcp_listener(address, port) { |socket| @http.bind(socket) }
-        Log.info { "Bound to #{tcp.local_address}" }
-        tcp.local_address
+        addr = bind_listener(address, port, nil)
+        Log.info { "Bound to #{addr}" }
+        addr
       end
 
       def bind_tls(address, port, ctx)
-        tcp = HTTP.tcp_listener(address, port) do |socket|
-          tls = OpenSSL::SSL::Server.new(socket, ctx)
-          tls.start_immediately = false
-          @http.bind(tls)
+        addr = bind_listener(address, port, ctx)
+        Log.info { "Bound on #{addr}" }
+        addr
+      end
+
+      private def bind_listener(address, port, tls_context) : ::Socket::IPAddress
+        tcp = HTTP.tcp_listener(address, port) do |tcp_server|
+          @http.bind ProxyProtocolListener.new(tcp_server, tls_context, ->follower?(String))
         end
-        Log.info { "Bound on #{tcp.local_address}" }
         tcp.local_address
       end
 

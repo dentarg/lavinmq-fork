@@ -125,6 +125,19 @@ private def tls_connections(s : LavinMQ::Server) : Array(String)
   end
 end
 
+# The status of GET /api/whoami as the default user on *port*, with *proxy_header* sent first
+private def whoami_status(port : Int32, proxy_header : String?) : Int32
+  socket = TCPSocket.new("127.0.0.1", port)
+  socket.read_timeout = 5.seconds
+  socket << proxy_header if proxy_header
+  socket << "GET /api/whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n" \
+            "Authorization: Basic #{Base64.strict_encode("guest:guest")}\r\n\r\n"
+  socket.flush
+  HTTP::Client::Response.from_io(socket, ignore_body: true).status_code
+ensure
+  socket.try &.close
+end
+
 describe LavinMQ::ClientListeners do
   it "forwards AMQP and AMQPS to the leader, with the client's address, until this node serves" do
     # The leader has no TLS port: this node terminates TLS, with its own
@@ -284,6 +297,27 @@ describe LavinMQ::ClientListeners do
       response.status_code.should eq 200
     ensure
       listeners.try &.close
+    end
+  end
+
+  it "hands HTTP to the broker with the client's address from a trusted PROXY header" do
+    with_amqp_server do |s|
+      with_proxy_protocol do
+        config = listener_config
+        config.amqp_port = config.amqps_port = -1
+        config.http_bind = "127.0.0.1"
+        config.http_port = free_port
+        listeners = LavinMQ::ClientListeners.new(config, -> { nil.as(Leader?) })
+        listeners.bind(nil, nil, nil)
+        listeners.listen
+        listeners.serve(LavinMQ::ClientListeners::Brokers.new(s.amqp_server, s.mqtt_server, s.http_server))
+        # The default user may only log in from loopback, and an address from
+        # a PROXY header never counts as loopback
+        whoami_status(config.http_port, "PROXY TCP4 127.0.0.1 127.0.0.1 54321 15672\r\n").should eq 401
+        whoami_status(config.http_port, nil).should eq 200
+      ensure
+        listeners.try &.close
+      end
     end
   end
 
