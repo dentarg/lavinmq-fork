@@ -80,66 +80,6 @@ module ClientReconnectSpec
     TCPServer.open("127.0.0.1", 0, &.local_address.port)
   end
 
-  # Holds the follow loop at a gate, either before it binds anything or after
-  # it bound the control socket, so a close can run at that point
-  class GatedClient < ClusteringSpecHelper::TestClient
-    getter gate = Channel(Nil).new
-    property? hold_before_bind = true
-
-    private def follow_loop(leader : LavinMQ::Clustering::Client::Leader)
-      @gate.receive if hold_before_bind?
-      super
-    end
-
-    private def hash_local_files : Nil
-      @gate.receive unless hold_before_bind?
-      super
-    end
-  end
-
-  # Follows a non-loopback leader, so the loop binds the control socket, closes
-  # while the loop is held at the gate, and checks that close unbound the socket
-  def self.close_while_held(data_dir, socket_path, hold_before_bind)
-    config = LavinMQ::Config.instance.dup
-    config.data_dir = data_dir
-    config.sync = false
-    config.metrics_http_port = -1
-    client = GatedClient.new(config, 1, "password", proxy: false)
-    client.hold_before_bind = hold_before_bind
-    spawn { client.follow("192.0.2.1", closed_port) }
-    Fiber.yield # the loop runs up to the gate
-    File.exists?(socket_path).should eq !hold_before_bind
-    closed = Channel(Exception?).new
-    spawn do
-      client.close
-      closed.send nil
-    rescue ex
-      closed.send ex
-    end
-    Fiber.yield # close waits for the loop
-    client.gate.send nil
-    select
-    when ex = closed.receive then raise ex if ex
-    when timeout(5.seconds) then fail "close didn't return"
-    end
-    expect_raises(Socket::ConnectError) { UNIXSocket.new(socket_path) }
-  ensure
-    if (server = client.try &.@internal_http_server) && !server.closed?
-      server.close
-    end
-  end
-
-  def self.with_control_socket_path(&)
-    config = LavinMQ::Config.instance
-    original_path = config.control_unix_path
-    socket_path = File.tempname("lavinmqctl-spec", ".sock")
-    config.control_unix_path = socket_path
-    yield socket_path
-  ensure
-    LavinMQ::Config.instance.control_unix_path = original_path if original_path
-    File.delete?(socket_path) if socket_path
-  end
-
   def self.framing(filename) : Int64
     (sizeof(Int32) + filename.bytesize + sizeof(Int64)).to_i64
   end
@@ -212,6 +152,86 @@ module ClientReconnectSpec
       end
     end
 
+    # The leader refuses a node that isn't a member, and both log it, so a
+    # removed node mustn't reconnect every second, forever. It should once
+    # it's added back though.
+    it "reconnects to a leader that refuses it only when it's a member again" do
+      with_datadir do |data_dir|
+        client = make_client(data_dir, sync: false)
+        member = false
+        client.member_check = -> { member }
+        leader = TCPServer.new("127.0.0.1", 0)
+        connects = Channel(Nil).new(16)
+        spawn(name: "refusing leader") do
+          while socket = leader.accept?
+            socket.close
+            connects.send nil
+          end
+        end
+        spawn(name: "follow") { client.follow("127.0.0.1", leader.local_address.port) }
+        connects.receive
+        select
+        when connects.receive
+          fail "reconnected while not a member"
+        when timeout(2.5.seconds)
+        end
+        member = true
+        select
+        when connects.receive
+        when timeout(3.seconds)
+          fail "didn't reconnect once a member again"
+        end
+      ensure
+        client.try &.close
+        leader.try &.close
+      end
+    end
+
+    # A leader that fails the handshake, here one that can't prove it knows
+    # the password, mustn't end replication for good: the runner still
+    # thinks this client follows it and won't replace it while that node
+    # leads. Both sides log each attempt, so the client waits longer each time.
+    it "keeps reconnecting, waiting longer each time, to a leader that fails the handshake" do
+      with_datadir do |data_dir|
+        client = make_client(data_dir, sync: false)
+        leader = TCPServer.new("127.0.0.1", 0)
+        accepted = Channel(Time::Instant).new(16)
+        spawn(name: "leader without the password") do
+          size = LavinMQ::Clustering::CHALLENGE_SIZE
+          while socket = leader.accept?
+            accepted.send Time.instant # before the handshake the client fails
+            begin
+              socket.write LavinMQ::Clustering::StartV3
+              socket.write Bytes.new(size)
+              # Read all the follower sends, so closing doesn't reset the connection
+              socket.read_fully(Bytes.new(8 + size + LavinMQ::Clustering::RESPONSE_SIZE))
+              socket.write_byte 0u8
+              socket.write Bytes.new(LavinMQ::Clustering::RESPONSE_SIZE) # not the leader's proof
+            rescue IO::Error
+            ensure
+              socket.close
+            end
+          end
+        end
+        spawn(name: "follow") { client.follow("127.0.0.1", leader.local_address.port) }
+        connects = Array(Time::Instant).new
+        3.times do
+          select
+          when instant = accepted.receive
+            connects << instant
+          when timeout(5.seconds)
+            fail "stopped reconnecting after #{connects.size} connection(s)"
+          end
+        end
+        # It waits 1s after the first failure, then 2s after the second, which
+        # comes after the second connect was accepted, so this is never shorter
+        (connects[2] - connects[1]).should be >= 1.5.seconds
+      ensure
+        client.try &.close
+        leader.try &.close
+      end
+    end
+
     it "closes at once when it never started following, and doesn't follow after" do
       with_datadir do |data_dir|
         client = make_client(data_dir, sync: false)
@@ -222,22 +242,6 @@ module ClientReconnectSpec
         select
         when followed.receive
         when timeout(1.second) then fail "follow didn't return after close"
-        end
-      end
-    end
-
-    it "unbinds the control socket when closed after the follow loop bound it" do
-      with_datadir do |data_dir|
-        with_control_socket_path do |socket_path|
-          close_while_held(data_dir, socket_path, hold_before_bind: false)
-        end
-      end
-    end
-
-    it "unbinds the control socket when closed before the follow loop bound it" do
-      with_datadir do |data_dir|
-        with_control_socket_path do |socket_path|
-          close_while_held(data_dir, socket_path, hold_before_bind: true)
         end
       end
     end

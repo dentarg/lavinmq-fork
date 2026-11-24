@@ -1,13 +1,249 @@
 require "./spec_helper"
 require "../src/lavinmq/launcher"
 
+# Without listeners other than the lavinmqctl socket
+private def standalone_config(data_dir) : LavinMQ::Config
+  config = LavinMQ::Config.new
+  config.data_dir = data_dir
+  config.data_dir_lock = false
+  config.amqp_port = config.amqps_port = config.http_port = config.https_port = -1
+  config.mqtt_port = config.mqtts_port = config.metrics_http_port = -1
+  config.unix_path = config.http_unix_path = config.mqtt_unix_path = ""
+  config.control_unix_path = File.join(data_dir, "control.sock")
+  config
+end
+
+# Test-only seam: run with the spec's runner instead of the configured one
 class LavinMQ::Launcher
-  def start_for_spec
-    start
+  def runner_for_spec=(@runner : LavinMQ::Runner)
+  end
+end
+
+class LavinMQ::Launcher
+  def demote_for_spec(hand_over : Proc(Nil)?) : Nil
+    demote(hand_over)
+  end
+end
+
+# Records whether the broker was closed when it stored the checksums
+private class StoreOrderServer < LavinMQ::Clustering::Server
+  property broker : LavinMQ::Server?
+  getter broker_closed_at_store : Bool? = nil
+
+  def close
+    @broker_closed_at_store = @broker.try &.closed?
+    super
+  end
+end
+
+# Serves with a StoreOrderServer as the replicator
+private class StoreOrderRunner < LavinMQ::StandaloneRunner
+  getter replicator : StoreOrderServer
+  # Closed once the broker has started
+  getter started = Channel(Nil).new
+
+  def initialize(config : LavinMQ::Config)
+    @replicator = StoreOrderServer.new(config, NullCoordinator.new, 1)
+  end
+
+  def run(& : LavinMQ::Clustering::Replicator? -> _)
+    super do
+      yield @replicator
+      @started.close
+    end
+  end
+
+  def broker_closed : Nil
+    @replicator.close
+  end
+end
+
+# Calls *on_write* at the broker's first replicated write, which loading a
+# new data dir makes
+private class FirstWriteServer < LavinMQ::Clustering::Server
+  def initialize(config : LavinMQ::Config, @on_write : Proc(Nil))
+    super(config, NullCoordinator.new, 1)
+  end
+
+  def replace_file(path : String)
+    @on_write.try &.call
+    @on_write = nil
+    super
+  end
+end
+
+# Stops the launcher just before yielding to start serving, as a shutdown can
+# race with a clustering runner's election. With *during_start* it stops it
+# at the broker's first replicated write instead, as a shutdown can arrive
+# while the broker loads.
+private class StoppingRunner < LavinMQ::StandaloneRunner
+  @replicator : FirstWriteServer?
+
+  def initialize(@config : LavinMQ::Config, @stop_launcher : Proc(Nil), @during_start = false)
+  end
+
+  def run(& : LavinMQ::Clustering::Replicator? -> _)
+    @stop_launcher.call unless @during_start
+    replicator = @replicator = FirstWriteServer.new(@config, @stop_launcher) if @during_start
+    super do
+      yield replicator
+    end
+  end
+
+  def broker_closed : Nil
+    @replicator.try &.close
+  end
+end
+
+# Stops the launcher from #start's call for the raft cluster, once the broker
+# has loaded, and records whether that closed the broker under the startup
+private class StoppingMidStartRunner < LavinMQ::StandaloneRunner
+  getter closed_under_startup : Bool? = nil
+
+  def initialize(@launcher : LavinMQ::Launcher)
+  end
+
+  def cluster_admin : LavinMQ::Clustering::ClusterAdmin?
+    @launcher.stop
+    @closed_under_startup = @launcher.@server.try &.closed?
+    nil
+  end
+end
+
+# Not the leader anymore, as the coordinator reports it
+private class StaleCoordinator < LavinMQ::Clustering::Coordinator
+  def update_isr(synced_node_ids : Set(Int32)) : Nil
+    raise LavinMQ::Clustering::Coordinator::StaleLeadership.new("Not the leader (spec)")
+  end
+
+  def password : String
+    "spec"
+  end
+end
+
+# Serves with a replicator that has lost leadership, as when it's lost
+# while the broker loads
+private class StaleLeaderRunner < LavinMQ::StandaloneRunner
+  def initialize(@config : LavinMQ::Config)
+  end
+
+  def run(& : LavinMQ::Clustering::Replicator? -> _)
+    super do
+      yield LavinMQ::Clustering::Server.new(@config, StaleCoordinator.new, 1)
+    end
+  end
+end
+
+# Runs *launcher* until #run returns, when the process would exit
+private def run_until_stopped(launcher : LavinMQ::Launcher) : Nil
+  done = Channel(Nil).new
+  spawn(name: "launcher spec") do
+    launcher.run
+  ensure
+    done.close
+  end
+  select
+  when done.receive?
+  when timeout(10.seconds)
+    fail "launcher didn't stop"
+  end
+end
+
+# Returns from #run once a shutdown starts, as when its lease expires
+# meanwhile, and takes a while to stop
+private class EarlyReturnRunner < LavinMQ::Runner
+  getter? stopped = false
+  getter started = Channel(Nil).new
+  @stopping = Channel(Nil).new
+
+  def run(& : LavinMQ::Clustering::Replicator? -> _)
+    yield nil
+    @started.close
+    @stopping.receive?
+  end
+
+  def stopping : Nil
+    @stopping.close
+  end
+
+  def stop
+    sleep 200.milliseconds
+    @stopped = true
   end
 end
 
 describe LavinMQ::Launcher do
+  # The broker writes files while it closes, and the next term's replication
+  # client trusts the stored checksums of files it doesn't rehash
+  it "stores the replication checksums after the broker is closed when leadership is lost" do
+    with_datadir do |data_dir|
+      config = standalone_config(data_dir)
+      launcher = LavinMQ::Launcher.new(config)
+      runner = StoreOrderRunner.new(config)
+      launcher.runner_for_spec = runner
+      done = Channel(Nil).new
+      spawn(name: "launcher run") do
+        launcher.run
+      ensure
+        done.close
+      end
+      runner.started.receive?
+      runner.replicator.broker = launcher.@server
+      launcher.demote_for_spec(nil)
+      runner.replicator.broker_closed_at_store.should be_true
+    ensure
+      launcher.try &.stop
+      done.try &.receive? # before the data dir is removed
+    end
+  end
+
+  it "doesn't start serving once stopped" do
+    with_datadir do |data_dir|
+      config = standalone_config(data_dir)
+      launcher = LavinMQ::Launcher.new(config)
+      launcher.runner_for_spec = StoppingRunner.new(config, -> { launcher.stop })
+      begin
+        run_until_stopped(launcher)
+        launcher.@server.should be_nil
+      ensure
+        launcher.@server.try &.close # before the data dir is removed
+      end
+    end
+  end
+
+  # It would fail what's still to come, e.g. loading definitions exits 1
+  it "leaves the broker to a startup that's running when stopped, and closes it after" do
+    with_datadir do |data_dir|
+      launcher = LavinMQ::Launcher.new(standalone_config(data_dir))
+      runner = StoppingMidStartRunner.new(launcher)
+      launcher.runner_for_spec = runner
+      begin
+        run_until_stopped(launcher)
+        runner.closed_under_startup.should be_false
+        launcher.@server.should_not(be_nil).closed?.should be_true
+        File.exists?(File.join(data_dir, "control.sock")).should be_false
+      ensure
+        launcher.@server.try &.close # before the data dir is removed
+      end
+    end
+  end
+
+  it "closes the broker it was starting when stopped meanwhile" do
+    with_datadir do |data_dir|
+      config = standalone_config(data_dir)
+      launcher = LavinMQ::Launcher.new(config)
+      launcher.runner_for_spec = StoppingRunner.new(config, -> { launcher.stop }, during_start: true)
+      begin
+        run_until_stopped(launcher)
+        # The process exits once #run has returned, what's open then is never closed
+        server = launcher.@server.should_not be_nil
+        server.closed?.should be_true
+      ensure
+        launcher.@server.try &.close # before the data dir is removed
+      end
+    end
+  end
+
   it "aborts startup when the AMQP listener can not bind" do
     blocker = TCPServer.new("127.0.0.1", 0)
     with_datadir do |data_dir|
@@ -27,7 +263,7 @@ describe LavinMQ::Launcher do
       launcher = LavinMQ::Launcher.new(config)
 
       expect_raises(SpecExit, /Exiting with code 1/) do
-        launcher.start_for_spec
+        launcher.run
       end
     ensure
       launcher.try &.stop
@@ -36,35 +272,62 @@ describe LavinMQ::Launcher do
     blocker.try &.close
   end
 
-  it "aborts startup when the control socket is in use, leaving it to the node serving it" do
+  it "serves the API over the lavinmqctl socket, and removes it when stopped" do
     with_datadir do |data_dir|
-      socket_path = File.tempname("lavinmqctl-spec", ".sock")
-      serving = UNIXServer.new(socket_path)
-      launcher : LavinMQ::Launcher? = nil
-      config = LavinMQ::Config.new
-      config.data_dir = data_dir
-      config.data_dir_lock = false
-      config.amqp_bind = "127.0.0.1"
-      config.amqp_port = 0
-      config.amqps_port = -1
-      config.http_port = -1
-      config.https_port = -1
-      config.mqtt_port = -1
-      config.mqtts_port = -1
-      config.metrics_http_port = -1
-      config.control_unix_path = socket_path
-      original_config = LavinMQ::Config.instance
-      LavinMQ::Config.instance = config # the HTTP server reads the control socket path from it
+      config = standalone_config(data_dir)
       launcher = LavinMQ::Launcher.new(config)
-
-      expect_raises(SpecExit, /Exiting with code 1/) do
-        launcher.start_for_spec
+      done = Channel(Nil).new
+      spawn(name: "launcher spec") do
+        launcher.run
+      ensure
+        done.close
       end
-      File.exists?(socket_path).should be_true
+      # A 503 until the broker serves
+      wait_for do
+        HTTP::Client.new(UNIXSocket.new(config.control_unix_path)).get("/api/whoami").status_code == 200
+      rescue Socket::Error
+        false
+      end
+      launcher.stop
+      select
+      when done.receive?
+      when timeout(10.seconds)
+        fail "launcher didn't stop"
+      end
+      File.exists?(config.control_unix_path).should be_false
+    end
+  end
+
+  it "aborts when another process serves the lavinmqctl socket" do
+    with_datadir do |data_dir|
+      config = standalone_config(data_dir)
+      other = UNIXServer.new(config.control_unix_path)
+      launcher = LavinMQ::Launcher.new(config)
+      expect_raises(SpecExit, /Exiting with code 1/) { launcher.run }
+      File.exists?(config.control_unix_path).should be_true # left to the process serving it
     ensure
-      launcher.try &.stop
-      LavinMQ::Config.instance = original_config if original_config
-      serving.try &.close
+      other.try &.close
+    end
+  end
+
+  it "returns from #run only once a shutdown that started has finished" do
+    with_datadir do |data_dir|
+      launcher = LavinMQ::Launcher.new(standalone_config(data_dir))
+      runner = EarlyReturnRunner.new
+      launcher.runner_for_spec = runner
+      done = Channel(Nil).new
+      spawn(name: "launcher run") do
+        launcher.run
+        done.close
+      end
+      runner.started.receive?
+      spawn(name: "shutdown") { launcher.stop }
+      select
+      when done.receive?
+      when timeout(5.seconds)
+        fail "run didn't return"
+      end
+      runner.stopped?.should be_true
     end
   end
 
@@ -79,6 +342,31 @@ describe LavinMQ::Launcher do
       end
     ensure
       lock.try &.release
+    end
+  end
+
+  # What Server.new opened before a replicated write failed couldn't be
+  # closed when stopping to serve
+  it "exits when it loses leadership while the broker loads" do
+    with_datadir do |data_dir|
+      config = standalone_config(data_dir)
+      launcher = LavinMQ::Launcher.new(config)
+      launcher.runner_for_spec = StaleLeaderRunner.new(config)
+      exited = Channel(Int32?).new(1)
+      spawn(name: "launcher spec") do
+        launcher.run
+        exited.send nil
+      rescue ex : SpecExit
+        exited.send ex.code
+      end
+      select
+      when code = exited.receive
+        code.should eq 3
+      when timeout(10.seconds)
+        fail "launcher didn't exit"
+      end
+    ensure
+      launcher.try &.stop
     end
   end
 end

@@ -1,6 +1,5 @@
 require "../spec_helper"
 require "../../src/lavinmq/clustering/server"
-require "../../src/lavinmq/clustering/etcd_coordinator"
 require "lz4"
 
 # Drives the clustering handshake + the two full-sync passes (requesting no
@@ -29,8 +28,33 @@ private def sync_fake_follower(server, port, id : Int32) : {TCPSocket, Compress:
   {io, lz4}
 end
 
-describe LavinMQ::Clustering::Server, tags: "etcd" do
-  add_etcd_around_each
+describe LavinMQ::Clustering::Server do
+  # A leader that loses leadership right after it started to serve can close
+  # its replicator before the listener fiber runs
+  it "doesn't listen once closed, nor overwrite the checksums it didn't restore" do
+    with_datadir do |data_dir|
+      config = LavinMQ::Config.new
+      config.data_dir = data_dir
+      checksums = File.join(data_dir, "checksums.sha1")
+      File.write(checksums, "#{Digest::SHA1.digest("a").hexstring} 1 *a\n")
+      server = LavinMQ::Clustering::Server.new(config, NullCoordinator.new, 0)
+      server.close
+      tcp = TCPServer.new("127.0.0.1", 0)
+      listened = Channel(Nil).new
+      spawn(name: "listener of a closed replicator") do
+        server.listen(tcp)
+        listened.close
+      end
+      select
+      when listened.receive?
+      when timeout(5.seconds)
+        tcp.close
+        fail "a closed replicator kept listening"
+      end
+      tcp.closed?.should be_true
+      File.read(checksums).should_not be_empty
+    end
+  end
 
   describe "#files_with_hash" do
     describe "for MFile" do
@@ -398,6 +422,22 @@ describe LavinMQ::Clustering::Server, tags: "etcd" do
     ensure
       mfiles.try &.each { |mf| mf.delete rescue nil }
       FileUtils.rm_rf LavinMQ::Config.instance.data_dir
+    end
+  end
+end
+
+describe LavinMQ::Clustering::Server do
+  # The runner closes it once the broker is closed, which can be before the
+  # fiber listening on the clustering port runs
+  it "closes a listener it starts listening on once closed" do
+    with_datadir do |data_dir|
+      config = LavinMQ::Config.new
+      config.data_dir = data_dir
+      server = LavinMQ::Clustering::Server.new(config, NullCoordinator.new, 0)
+      listener = TCPServer.new("127.0.0.1", 0)
+      server.close
+      server.listen(listener)
+      listener.closed?.should be_true
     end
   end
 end

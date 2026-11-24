@@ -8,11 +8,11 @@ require "./amqp/server"
 require "./mqtt/server"
 require "./http/http_server"
 require "./http/metrics_server"
+require "./http/control_socket"
+require "./client_listeners"
 require "./data_dir_lock"
 require "./pidfile"
-require "./etcd"
-require "./clustering/controller"
-require "./clustering/etcd_coordinator"
+require "./clustering/runner"
 require "./standalone_runner"
 require "./definitions"
 require "../stdlib/openssl_on_server_name"
@@ -25,14 +25,27 @@ module LavinMQ
     @mqtt_tls_context : OpenSSL::SSL::Context::Server?
     @http_tls_context : OpenSSL::SSL::Context::Server?
     @first_shutdown_attempt = true
+    # Closed once #run has returned
     @run_done = Channel(Nil).new
     @data_dir_lock : DataDirLock?
     @closed = false
-    @replicator : Clustering::Server?
+    # While #start runs, #stop leaves what it opens to it, see #start
+    @starting = false
+    # Closed when #stop is done
+    @stopped = Channel(Nil).new
+    @runner : Runner
+    # Serializes starting and stopping to serve as the leader with a shutdown
+    @role_lock = Mutex.new
     @server : LavinMQ::Server?
     @amqp_server : LavinMQ::AMQP::Server?
     @mqtt_server : LavinMQ::MQTT::Server?
     @metrics_server : LavinMQ::HTTP::MetricsServer?
+    # The lavinmqctl socket, bound once for the process: the broker's API
+    # while this node serves, the runner's view of the cluster otherwise
+    @control_socket : HTTP::ControlSocket
+    # The client ports, bound once for the process: the broker's while this
+    # node serves, forwarded to the leader otherwise
+    @client_listeners : ClientListeners
 
     def initialize(@config : Config)
       print_environment_info
@@ -47,16 +60,12 @@ module LavinMQ
       acquire_data_dir_lock if @config.data_dir_lock?
       print_data_dir_read_ahead
 
-      @metrics_server = LavinMQ::HTTP::MetricsServer.new unless @config.metrics_http_port == -1
-
-      if @config.clustering?
-        etcd = Etcd.new(@config.clustering_etcd_endpoints)
-        coordinator = Clustering::EtcdCoordinator.new(@config, etcd)
-        @runner = controller = Clustering::Controller.new(@config, etcd, coordinator, @metrics_server)
-        @replicator = Clustering::Server.new(@config, coordinator, controller.id)
-      else
-        @runner = StandaloneRunner.new
-      end
+      @runner = @config.clustering? ? Clustering::Runner.create(@config) : StandaloneRunner.new
+      @runner.on_demote { |hand_over| demote(hand_over) }
+      @metrics_server = LavinMQ::HTTP::MetricsServer.new(metrics: runner_metrics) unless @config.metrics_http_port == -1
+      @control_socket = HTTP::ControlSocket.new(@config.control_unix_path, -> { @runner.cluster_status })
+      @client_listeners = ClientListeners.new(@config, -> { @runner.leader.as(Clustering::Client::Leader?) })
+      @runner.on_leader_change { @client_listeners.leader_changed }
 
       if @config.tls_configured?
         @amqp_tls_context = create_tls_context
@@ -69,47 +78,123 @@ module LavinMQ
       GCPauseRecorder.install
     end
 
-    private def start : self
+    private def start(replicator : Clustering::Replicator?) : self
+      # #stop may have run since the runner decided to serve, e.g. while the
+      # raft runner committed the ISR: nothing started from here on would
+      # be closed. A #stop from now on leaves the broker to this startup,
+      # closing it under it would fail what's still to come, e.g. loading
+      # definitions exits 1, and #run closes it once the runner returns.
+      return self unless @role_lock.synchronize { @starting = !@closed }
       started_at = Time.instant
-      @server = server = LavinMQ::Server.new(@config, @replicator)
+      @control_socket.starting
+      @server = server = new_server(replicator)
       load_definitions(server)
       server.start_log_exchange
       @amqp_server = amqp_server = LavinMQ::AMQP::Server.new(server, @config)
       @mqtt_server = mqtt_server = LavinMQ::MQTT::Server.new(server, @config)
-      @http_server = http_server = LavinMQ::HTTP::Server.new(server, amqp_server, mqtt_server)
-      start_listeners(amqp_server, mqtt_server, http_server)
-      @metrics_server.try &.leader = server
+      @http_server = http_server = LavinMQ::HTTP::Server.new(server, amqp_server, mqtt_server, @runner.cluster_admin,
+        @control_socket.path, runner_metrics)
+      @client_listeners.serve(ClientListeners::Brokers.new(amqp_server, mqtt_server, http_server))
+      # If it couldn't be bound when the process started, e.g. while another
+      # node on this machine had it
+      @control_socket.bind
+      @control_socket.api = http_server.handler
+      @metrics_server.try &.amqp_server = server
       SystemD.notify_ready
       Fiber.yield # Yield to let listeners spawn before logging startup time
       Log.info { "Finished startup in #{(Time.instant - started_at).total_seconds}s" }
       self
-    rescue ex : Socket::BindError | HTTP::ControlSocketError
+    rescue ex : Socket::BindError
       stop
       abort "Error: #{ex.message}"
+    ensure
+      @role_lock.synchronize { @starting = false }
     end
 
     def run
       start_metrics_server
-      @runner.run do
-        start
+      bind_control_socket
+      begin
+        @client_listeners.bind(@amqp_tls_context, @mqtt_tls_context, @http_tls_context)
+      rescue ex : Socket::BindError
+        abort "Error: #{ex.message}"
       end
-      @replicator.try &.close
+      # A standalone node accepts when it serves, until then connections
+      # wait. A clustered one forwards them to the leader meanwhile.
+      @client_listeners.listen if @config.clustering?
+      @runner.run do |replicator|
+        start(replicator)
+      end
+      # The runner returns once a shutdown has started, e.g. when its lease
+      # expires meanwhile, and the broker may still be closing
+      @stopped.receive? if @role_lock.synchronize { @closed }
+      # What a startup that #stop raced with opened, see #start
+      @role_lock.synchronize do
+        close_listeners
+        @server.try &.close rescue nil
+      end
+      @client_listeners.close
+      @control_socket.close
+      @runner.broker_closed
       @data_dir_lock.try &.release
     ensure
       @run_done.close
     end
 
-    def stop
-      return if @closed
-      @closed = true
-      Log.warn { "Stopping" }
-      SystemD.notify_stopping
+    # Stops serving as the leader, without exiting: the raft runner keeps
+    # its raft node running and makes this node follow the new leader, and
+    # the next time it's elected #start serves again. When leadership was
+    # lost (no *hand_over*) the runner has disconnected the followers, so
+    # nothing more can be confirmed. When it's handed over the clients are
+    # disconnected first, and leadership is handed over once the followers
+    # have acked everything and before they're disconnected, so the target
+    # is still in the ISR.
+    private def demote(hand_over : Proc(Nil)?) : Nil
+      @role_lock.synchronize do
+        return if @closed
+        # Scrapes would get the closed broker's metrics until it's done
+        @metrics_server.try &.stop_reporting_broker
+        close_listeners
+        if server = @server
+          # Keeps the replicator's checksums, which the replication client
+          # reuses when it starts following
+          server.close rescue nil
+        end
+        hand_over.try &.call
+        @runner.broker_closed
+        @http_server = nil
+        @amqp_server = nil
+        @mqtt_server = nil
+        @server = nil
+      end
+    end
+
+    private def close_listeners : Nil
+      @control_socket.api = nil
+      @client_listeners.serve(nil)
       @http_server.try &.close rescue nil
       @amqp_server.try &.close rescue nil
       @mqtt_server.try &.close rescue nil
-      @server.try &.close rescue nil
-      @metrics_server.try &.close rescue nil
+    end
+
+    def stop
+      stopping = false
+      @role_lock.synchronize do
+        return if @closed
+        stopping = @closed = true
+        Log.warn { "Stopping" }
+        SystemD.notify_stopping
+        @runner.stopping
+        # A startup that's running closes what it opens once it's done, see #start
+        close_listeners unless @starting
+        @client_listeners.close
+        @control_socket.close
+        @server.try(&.close) rescue nil unless @starting
+        @metrics_server.try &.close rescue nil
+      end
       @runner.stop
+    ensure
+      @stopped.close if stopping
     end
 
     # Exits if another process holds the lock, before the server or the
@@ -187,6 +272,15 @@ module LavinMQ
       nil
     end
 
+    # Replicated writes in it fail once leadership is lost, but what it opened
+    # before that wouldn't be closed when stopping to serve, so it exits
+    private def new_server(replicator : Clustering::Replicator?) : LavinMQ::Server
+      LavinMQ::Server.new(@config, replicator)
+    rescue ex : Clustering::Coordinator::StaleLeadership
+      Log.fatal { "Lost leadership while loading the broker, exiting: #{ex.message}" }
+      exit 3
+    end
+
     private def load_definitions(amqp_server)
       path = @config.load_definitions
       return if path.empty?
@@ -200,13 +294,16 @@ module LavinMQ
     rescue ex : JSON::ParseException
       Log.error { "Failed to load definitions: invalid JSON in '#{path}': #{ex.message}" }
       exit 1
+    rescue ex : Clustering::Coordinator::StaleLeadership
+      raise ex # lost leadership, the runner stops serving
     rescue ex
       Log.error(exception: ex) { "Failed to load definitions from '#{path}'" }
       exit 1
     end
 
-    # Bound once, before the node knows its role, and kept until shutdown so
-    # that the port isn't rebound when a follower becomes leader
+    # One metrics server for the rest of the process, bound before a clustered
+    # node knows its role, so followers and nodes without a leader are
+    # monitored too. It reports the broker's metrics once this node serves.
     private def start_metrics_server
       return unless metrics_server = @metrics_server
       metrics_server.bind_tcp(@config.metrics_http_bind, @config.metrics_http_port)
@@ -218,48 +315,20 @@ module LavinMQ
       abort "Error: #{ex.message}"
     end
 
-    private def start_listeners(amqp_server, mqtt_server, http_server)
-      bind_listeners(amqp_server, @config.amqp_bind, @config.amqp_port, @config.amqps_port, @amqp_tls_context, @config.unix_path)
-      bind_listeners(mqtt_server, @config.mqtt_bind, @config.mqtt_port, @config.mqtts_port, @mqtt_tls_context, @config.mqtt_unix_path)
-      bind_listeners(http_server, @config.http_bind, @config.http_port, @config.https_port, @http_tls_context, @config.http_unix_path)
-      http_server.bind_internal_unix
-
-      unless amqp_server.listeners.empty?
-        spawn(name: "AMQP listener") do
-          amqp_server.listen
-        end
-      end
-      unless mqtt_server.listeners.empty?
-        spawn(name: "MQTT listener") do
-          mqtt_server.listen
-        end
-      end
-      if clustering_bind = @config.clustering_bind
-        if replicator = @replicator
-          clustering_server = bind_clustering_listener(clustering_bind, @config.clustering_port)
-          spawn(name: "Clustering listener") { replicator.listen(clustering_server) }
-        end
-      end
-      spawn(name: "HTTP listener") do
-        http_server.listen
-      end
+    private def runner_metrics : Proc(HTTP::PrometheusWriter, Nil)
+      ->@runner.write_metrics(HTTP::PrometheusWriter)
     end
 
-    private def bind_clustering_listener(bind, port)
-      TCPServer.new(bind, port)
-    rescue ex : Socket::BindError
+    # A clustered node may share the machine with another node serving the
+    # socket, a standalone one shouldn't run then
+    private def bind_control_socket : Nil
+      if @config.clustering?
+        @control_socket.bind
+      else
+        @control_socket.bind!
+      end
+    rescue ex
       abort "Error: #{ex.message}"
-    end
-
-    # Binds the plain TCP, TLS and unix listeners a server is configured for.
-    # Works for any server exposing bind_tcp/bind_tls/bind_unix (the protocol
-    # servers and the HTTP server).
-    private def bind_listeners(server, bind, port, tls_port, tls_context, unix_path)
-      server.bind_tcp(bind, port) if port > 0
-      if tls_port > 0 && (ctx = tls_context)
-        server.bind_tls(bind, tls_port, ctx)
-      end
-      server.bind_unix(unix_path) unless unix_path.empty?
     end
 
     private def dump_debug_info
@@ -341,28 +410,22 @@ module LavinMQ
       if @first_shutdown_attempt
         @first_shutdown_attempt = false
         stop
+        # The process exits once #run has returned. Exiting from here
+        # instead closes the log while #run, or this, could still log.
+        select
+        when @run_done.receive?
+          return
+        when timeout(SHUTDOWN_TIMEOUT)
+          Log.warn { "Shutdown didn't finish in #{SHUTDOWN_TIMEOUT.total_seconds}s, exiting" }
+        end
         Log.info { "Fibers: " }
         Fiber.list { |f| Log.info { f.inspect } }
-        # A started node closes the replicator when #run returns, then the main
-        # fiber exits. Exiting from here before that closes the log backend
-        # while it may still be logging. A follower has nothing to close.
-        return if @server && run_finished?
         Fiber.yield
         exit 0
       else
         Log.info { "Fibers: " }
         Fiber.list { |f| Log.info { f.inspect } }
         exit 1
-      end
-    end
-
-    private def run_finished? : Bool
-      select
-      when @run_done.receive?
-        true
-      when timeout(SHUTDOWN_TIMEOUT)
-        Log.warn { "Shutdown didn't finish in #{SHUTDOWN_TIMEOUT.total_seconds}s, exiting" }
-        false
       end
     end
 

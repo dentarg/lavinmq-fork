@@ -28,12 +28,19 @@ module LavinMQ::Clustering
       leader
     end
 
+    class StaleLeadership < Coordinator::StaleLeadership
+    end
+
+    # Raises StaleLeadership once the election this node won is gone, e.g.
+    # its lease expired
     def update_isr(synced_node_ids : Set(Int32)) : Nil
       leader = @election_leader.get
-      raise Etcd::StaleLeadership.new(leader_key) unless leader && leader.election == leader_key
+      raise StaleLeadership.new("Not the leader for election #{leader_key}") unless leader && leader.election == leader_key
 
       ids = synced_node_ids.map(&.to_s(36)).join(",")
       @etcd.put_if_election_leader(isr_key, ids, leader)
+    rescue ex : Etcd::StaleLeadership
+      raise StaleLeadership.new(ex.message, cause: ex)
     end
 
     # The current in-sync replica set, or nil if none has been recorded yet (a
@@ -43,7 +50,7 @@ module LavinMQ::Clustering
     end
 
     # Yield the parsed ISR set on every change to the ISR key (nil when the key
-    # is deleted), until the block breaks. Used by the Controller to wait for
+    # is deleted), until the block breaks. Used by the Runner to wait for
     # this node to (re)appear in the ISR before serving as leader.
     def watch_isr(&)
       @etcd.watch(isr_key) do |value|

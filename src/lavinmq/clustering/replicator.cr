@@ -30,13 +30,58 @@ module LavinMQ
       # acknowledged to a client (publish confirms via the Persister,
       # definition changes via the DefinitionsStore).
       abstract def wait_for_followers : Nil
+
+      # Waits up to *timeout* for the in-sync followers to ack what has been
+      # replicated, without changing the ISR. For when nothing more is
+      # acknowledged, like a closing broker, which mustn't wait on the
+      # coordinator. False when they didn't in time.
+      def wait_for_acks(timeout : Time::Span) : Bool
+        true
+      end
+
       # Ask every in-sync follower to fsync these (absolute) paths, or to sync
       # its whole data dir, before acking past what has been replicated so far.
       # Callers then wait_for_followers.
       abstract def request_fsync(paths : Enumerable(String)) : Nil
       abstract def request_syncfs : Nil
       abstract def all_followers : Array(Follower)
+
+      # Whether a follower that has authenticated is connected from *address*,
+      # registered or not yet. Its PROXY headers are trusted, see ClientListeners.
+      def follower_address?(address : String) : Bool
+        address = Replicator.plain_address(address)
+        all_followers.any? { |f| Replicator.plain_address(f.remote_address.address) == address }
+      end
+
+      # An IPv4 address as a dual-stack listener reports it ("::ffff:10.0.0.2")
+      # as an IPv4 listener does ("10.0.0.2"), as the replication and client
+      # listeners may be bound differently
+      def self.plain_address(address : String) : String
+        if address.starts_with?("::ffff:") && address.includes?('.')
+          address[7..]
+        else
+          address
+        end
+      end
+
       abstract def close
+
+      # Called as the broker starts to close. What it writes is still
+      # replicated, e.g. to a leadership transfer target, but from then on a
+      # write that finds leadership lost completes instead of raising
+      # Coordinator::StaleLeadership halfway through the close. Only
+      # #wait_for_followers acknowledges anything then, and it still raises.
+      def broker_closing : Nil
+      end
+
+      # Set for good once nothing can be acknowledged as replicated anymore:
+      # replication was closed, or the coordinator said this node isn't the
+      # leader. Writes still complete locally (the broker may be closing), but
+      # #wait_for_followers raises Coordinator::StaleLeadership from then on.
+      def fenced? : Bool
+        false
+      end
+
       abstract def listen(server : TCPServer)
       abstract def clear
       abstract def password : String
